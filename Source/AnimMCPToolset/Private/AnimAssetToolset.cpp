@@ -5,6 +5,11 @@
 #include "AnimMCPHelpers.h"
 
 #include "Animation/AnimBlueprint.h"
+#include "AnimGraphNode_StateMachineBase.h"
+#include "AnimStateConduitNode.h"
+#include "AnimStateNodeBase.h"
+#include "AnimStateTransitionNode.h"
+#include "AnimationStateMachineGraph.h"
 #include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimSequence.h"
@@ -13,6 +18,7 @@
 #include "Animation/Skeleton.h"
 #include "AssetToolsModule.h"
 #include "EdGraphSchema_K2.h"
+#include "EdGraphToken.h"
 #include "Engine/SkeletalMesh.h"
 #include "Factories/AnimBlueprintFactory.h"
 #include "Factories/BlendSpaceFactory1D.h"
@@ -23,6 +29,7 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/StringOutputDevice.h"
+#include "Misc/UObjectToken.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
@@ -75,6 +82,112 @@ namespace
 	UClass* GetSearchClass(UBlueprint* Blueprint)
 	{
 		return Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass.Get() : Blueprint->GeneratedClass.Get();
+	}
+
+	/** Fills state machine context (state machine, state, transition) for a node by walking up its graphs. */
+	void AddGraphContext(const UEdGraphNode* Node, const TSharedRef<FJsonObject>& Json, TArray<FString>& Path)
+	{
+		auto Describe = [&Json, &Path](const UEdGraphNode* Owner)
+		{
+			if (const UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(Owner))
+			{
+				const FString Label = FString::Printf(TEXT("%s -> %s"),
+					Transition->GetPreviousState() ? *Transition->GetPreviousState()->GetStateName() : TEXT("?"),
+					Transition->GetNextState() ? *Transition->GetNextState()->GetStateName() : TEXT("?"));
+				if (!Json->HasField(TEXT("transition")))
+				{
+					Json->SetStringField(TEXT("transition"), Label);
+					Json->SetStringField(TEXT("transition_guid"), AnimMCP::GuidToString(Transition->NodeGuid));
+				}
+				Path.Insert(TEXT("transition ") + Label, 0);
+			}
+			else if (const UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(Owner))
+			{
+				if (!Json->HasField(TEXT("state")))
+				{
+					Json->SetStringField(TEXT("state"), State->GetStateName());
+					Json->SetStringField(TEXT("state_guid"), AnimMCP::GuidToString(State->NodeGuid));
+				}
+				Path.Insert(FString::Printf(TEXT("%s %s"), State->IsA<UAnimStateConduitNode>() ? TEXT("conduit") : TEXT("state"), *State->GetStateName()), 0);
+			}
+			else if (const UAnimGraphNode_StateMachineBase* Machine = Cast<UAnimGraphNode_StateMachineBase>(Owner))
+			{
+				const FString Name = Machine->EditorStateMachineGraph ? Machine->EditorStateMachineGraph->GetName() : Machine->GetName();
+				if (!Json->HasField(TEXT("state_machine")))
+				{
+					Json->SetStringField(TEXT("state_machine"), Name);
+					Json->SetStringField(TEXT("state_machine_guid"), AnimMCP::GuidToString(Machine->NodeGuid));
+				}
+				Path.Insert(TEXT("state machine ") + Name, 0);
+			}
+		};
+
+		// The node itself may be a state, conduit or transition (e.g. "will never be taken").
+		Describe(Node);
+		const UEdGraph* Graph = Node->GetGraph();
+		while (Graph)
+		{
+			const UEdGraphNode* Owner = Cast<UEdGraphNode>(Graph->GetOuter());
+			if (!Owner)
+			{
+				Path.Insert(Graph->GetName(), 0);
+				break;
+			}
+			Describe(Owner);
+			Graph = Owner->GetGraph();
+		}
+	}
+
+	/** The node (and pin) a compiler message points at, with its place in the blueprint. Null if the message names no node. */
+	TSharedPtr<FJsonObject> DescribeMessageSource(const FTokenizedMessage& Message)
+	{
+		for (const TSharedRef<IMessageToken>& Token : Message.GetMessageTokens())
+		{
+			const UObject* Object = nullptr;
+			const UEdGraphPin* Pin = nullptr;
+			if (Token->GetType() == EMessageToken::EdGraph)
+			{
+				const FEdGraphToken& GraphToken = static_cast<const FEdGraphToken&>(Token.Get());
+				Object = GraphToken.GetGraphObject();
+				Pin = GraphToken.GetPin();
+				if (!Object && Pin)
+				{
+					Object = Pin->GetOwningNodeUnchecked();
+				}
+			}
+			else if (Token->GetType() == EMessageToken::Object)
+			{
+				Object = static_cast<const FUObjectToken&>(Token.Get()).GetObject().Get();
+			}
+
+			const UEdGraphNode* Node = Cast<UEdGraphNode>(Object);
+			if (!Node)
+			{
+				continue;
+			}
+			TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+			Json->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Node->NodeGuid));
+			Json->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+			Json->SetStringField(TEXT("node_class"), Node->GetClass()->GetName());
+			if (const UEdGraph* Graph = Node->GetGraph())
+			{
+				Json->SetStringField(TEXT("graph"), Graph->GetName());
+				Json->SetStringField(TEXT("graph_guid"), AnimMCP::GuidToString(Graph->GraphGuid));
+			}
+			if (Pin)
+			{
+				Json->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+			}
+			TArray<FString> Path;
+			AddGraphContext(Node, Json, Path);
+			if (!Node->IsA<UAnimStateNodeBase>())
+			{
+				Path.Add(Json->GetStringField(TEXT("node_title")));
+			}
+			Json->SetStringField(TEXT("location"), FString::Join(Path, TEXT(" > ")));
+			return Json;
+		}
+		return nullptr;
 	}
 
 	UObject* CreateAssetWithFactory(const FString& Folder, const FString& AssetName, UClass* AssetClass, UFactory* Factory)
@@ -448,6 +561,10 @@ FAnimMCPResult UAnimAssetToolset::anim_compile_blueprint(const FString& blueprin
 		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 		Item->SetStringField(TEXT("severity"), FTokenizedMessage::GetSeverityText(Message->GetSeverity()).ToString());
 		Item->SetStringField(TEXT("message"), Message->ToText().ToString());
+		if (const TSharedPtr<FJsonObject> Source = DescribeMessageSource(*Message))
+		{
+			Item->SetObjectField(TEXT("source"), Source);
+		}
 		Messages.Add(MakeShared<FJsonValueObject>(Item));
 	}
 

@@ -78,7 +78,9 @@ public:
 	static FAnimMCPResult anim_remove_transition(const FString& blueprint_path, const FString& transition_guid);
 
 	/**
-	 * Sets when a transition may be taken. This replaces the whole rule graph of the transition.
+	 * Sets when a transition may be taken, or when a conduit may be passed through. This replaces the whole rule graph.
+	 * A rule that is accepted but cannot fire as things stand (for example time_remaining when the source state has no animation)
+	 * still succeeds and is reported in the result's warnings.
 	 * rule values:
 	 *  'bool_variable' - take the transition while a bool member variable is true (needs variable_name);
 	 *  'not_bool_variable' - take it while that bool variable is false (needs variable_name);
@@ -87,14 +89,14 @@ public:
 	 *  'time_remaining' - automatic rule: take it when the source state's animation is about to finish (uses trigger_time);
 	 *  'always' - always true; 'never' - always false.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
-	 * @param transition_guid node_guid of the transition.
+	 * @param transition_guid node_guid of the transition, or of a conduit to set the conduit's entry rule (time_remaining does not apply to conduits).
 	 * @param rule One of: bool_variable, not_bool_variable, compare, time_remaining, always, never.
 	 * @param variable_name Member variable the rule reads: a bool for bool_variable / not_bool_variable, a float, int, int64 or byte for compare. Create it with anim_add_variable if needed. 'none' for other rules.
 	 * @param trigger_time For time_remaining: seconds before the end of the source animation at which to transition. Negative = use the crossfade duration.
-	 * @param crossfade_duration Optional new blend time in seconds. Negative = leave unchanged.
+	 * @param crossfade_duration Optional new blend time in seconds (transitions only). Negative = leave unchanged.
 	 * @param comparison For compare: one of >, >=, <, <=, ==, !=. The rule is 'variable <comparison> threshold'.
 	 * @param threshold For compare: the number to compare against. Must be a whole number when the variable is an int, int64 or byte.
-	 * @return Result: the updated transition node plus rule and rule_nodes (node_guids created in the rule graph).
+	 * @return Result: the updated transition (or conduit) node plus rule, rule_nodes (node_guids created in the rule graph) and warnings.
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name = TEXT("none"), float trigger_time = -1.f, float crossfade_duration = -1.f,
@@ -150,14 +152,15 @@ public:
 	 *   "states": [ {"name": "Idle", "animation": "/Game/Anims/Idle", "loop": true, "play_rate": 1.0, "x": 300, "y": 0} ],
 	 *                                      // animation is optional; node_type and slot_name work as in anim_set_state_animation;
 	 *                                      // positions default to a grid
-	 *   "conduits": [ {"name": "Branch"} ],
+	 *   "conduits": [ {"name": "Branch", "rule": "bool_variable", "variable": "bIsFalling"} ],  // rule fields as for transitions
 	 *   "transitions": [ {"from": "Idle", "to": "Run", "rule": "compare", "variable": "Speed", "comparison": ">", "threshold": 10,
 	 *                     "crossfade_duration": 0.2} ]
 	 *                                      // rule fields as in anim_set_transition_rule: rule, variable, comparison, threshold, trigger_time
 	 * }
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param spec The state machine description as JSON text (see above).
-	 * @return Result: {state_machine, state_machine_graph_guid, entry_node_guid, variables_created, variables_reused, states: [{name, node_guid, player_node_guid}], conduits: [{name, node_guid}], transitions: [{from, to, node_guid, rule, rule_nodes}], warnings}.
+	 * @return Result: {state_machine, state_machine_graph_guid, entry_node_guid, variables_created, variables_reused, states: [{name, node_guid, player_node_guid}], conduits: [{name, node_guid, rule, rule_nodes}], transitions: [{from, to, node_guid, rule, rule_nodes}], warnings}.
+	 *         warnings lists rules that were built but cannot fire as things stand (missing rules, time_remaining from a state with no animation).
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_build_state_machine(const FString& blueprint_path, const FString& spec);

@@ -100,7 +100,9 @@ public:
 	/**
 	 * Compiles an Animation Blueprint and reports errors and warnings. Does not save.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
-	 * @return Result: {status, num_errors, num_warnings, messages: [{severity, message}]}. Success is true even when the blueprint has compile errors; check num_errors.
+	 * @return Result: {status, num_errors, num_warnings, messages: [{severity, message, source}]}. Success is true even when the blueprint has compile errors; check num_errors.
+	 *         source (when the message names a node): {node_guid, node_title, node_class, graph, graph_guid, pin, state_machine, state, transition (+ their _guid), location},
+	 *         where location reads like 'AnimGraph > state machine Locomotion > state JumpUp > Sequence Player'.
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
 	static FAnimMCPResult anim_compile_blueprint(const FString& blueprint_path);

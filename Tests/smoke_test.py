@@ -196,5 +196,38 @@ r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2
 r and log("%s spec node types: %s" % ("OK  " if r["states"][1].get("slot_node_guid") and r["states"][0].get("player_node_guid") else "FAIL", r["states"]))
 r = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP2); r and log("%s compile after node types: errors=%d warnings=%d" % ("OK  " if r["num_errors"] == 0 else "FAIL", r["num_errors"], r["num_warnings"]))
 
+# --- v0.2 step 4: dead-rule warnings, conduit rules, compile message sources
+spec4 = {"name": "Jump", "variables": [{"name": "bJump", "type": "bool"}],
+         "states": [{"name": "Ground", "animation": IDLE}, {"name": "JumpUp"}, {"name": "JumpDown", "animation": WALK, "loop": False}],
+         "conduits": [{"name": "Gate", "rule": "bool_variable", "variable": "bJump"}],
+         "transitions": [{"from": "Ground", "to": "Gate", "rule": "always"}, {"from": "Gate", "to": "JumpUp", "rule": "always"},
+                         {"from": "JumpUp", "to": "JumpDown", "rule": "time_remaining"},
+                         {"from": "JumpDown", "to": "Ground", "rule": "time_remaining"}, {"from": "JumpDown", "to": "JumpUp"}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec=json.dumps(spec4))
+if r:
+    w = r["warnings"]
+    log("%s build warnings: %s" % ("OK  " if len(w) == 2 and any("JumpUp" in x and "time_remaining" in x for x in w) and any("no rule" in x for x in w) else "FAIL", w))
+    log("%s conduit rule: %s" % ("OK  " if r["conduits"][0]["rule"] == "bool_variable" and len(r["conduits"][0]["rule_nodes"]) == 1 else "FAIL", r["conduits"][0]))
+    jt = {(t["from"], t["to"]): t["node_guid"] for t in r["transitions"]}
+    st_guid = {s["name"]: s["node_guid"] for s in r["states"]}
+    t = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP2, transition_guid=jt[("JumpUp", "JumpDown")], rule="time_remaining", trigger_time=0.1)
+    t and log("%s dead rule accepted with warning: %s" % ("OK  " if len(t["warnings"]) == 1 else "FAIL", t["warnings"]))
+    t = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP2, transition_guid=jt[("JumpDown", "Ground")], rule="time_remaining")
+    t and log("%s live rule has no warning: %s" % ("OK  " if t["warnings"] == [] else "FAIL", t["warnings"]))
+    t = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP2, transition_guid=r["conduits"][0]["node_guid"], rule="compare", variable_name="Speed", comparison=">", threshold=1)
+    t and log("%s conduit rule via anim_set_transition_rule: %s" % ("OK  " if t["rule"] == "compare" else "FAIL", t["rule"]))
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP2, transition_guid=r["conduits"][0]["node_guid"], rule="time_remaining")
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP2, transition_guid=st_guid["Ground"], rule="always")
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP2)
+    if c:
+        srcs = [m.get("source") for m in c["messages"]]
+        log("compile messages: %s" % [(m["message"][:60], (m.get("source") or {}).get("location")) for m in c["messages"]])
+        log("%s every compile message has a source: %d/%d" % ("OK  " if c["messages"] and all(srcs) else "FAIL", len([x for x in srcs if x]), len(srcs)))
+        never = [m for m in c["messages"] if "never be taken" in m["message"]]
+        # The engine only warns for conduits here; a transition with no rule is silent at compile time (anim_build_state_machine warns instead).
+        log("%s 'never taken' names the conduit: %s" % ("OK  " if never and (never[0].get("source") or {}).get("location") == "AnimGraph > state machine Loco > conduit Air" else "FAIL", never and never[0]["source"].get("location")))
+        ignored = [m for m in c["messages"] if "visible but ignored" in m["message"]]
+        log("%s 'visible but ignored' names the state: %s" % ("OK  " if ignored and (ignored[0].get("source") or {}).get("state") == "Options" else "FAIL", ignored and ignored[0]["source"].get("location")))
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

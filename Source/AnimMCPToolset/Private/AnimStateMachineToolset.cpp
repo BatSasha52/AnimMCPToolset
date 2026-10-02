@@ -330,21 +330,27 @@ namespace
 	}
 
 	/**
-	 * Replaces the transition's rule with a resolved rule. The caller owns the transaction.
+	 * Replaces the rule of a transition, or the entry rule of a conduit, with a resolved rule. The caller owns the transaction.
 	 * OutRuleNodes receives the nodes created in the rule graph.
 	 */
-	bool ApplyRule(UAnimBlueprint* AnimBP, UAnimStateTransitionNode* Transition, const FResolvedRule& Rule, TArray<UEdGraphNode*>& OutRuleNodes, FString& OutError)
+	bool ApplyRule(UAnimBlueprint* AnimBP, UAnimStateNodeBase* Owner, const FResolvedRule& Rule, TArray<UEdGraphNode*>& OutRuleNodes, FString& OutError)
 	{
-		if (Transition->IsBoundGraphShared())
+		UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(Owner);
+		if (Transition && Transition->IsBoundGraphShared())
 		{
 			OutError = TEXT("This transition uses shared rules. Unshare its rules in the editor before editing it here.");
 			return false;
 		}
-		UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(Transition->BoundGraph);
+		if (!Transition && Rule.Kind == ERuleKind::TimeRemaining)
+		{
+			OutError = TEXT("time_remaining is a transition setting; a conduit has no animation to wait for. Use a variable rule for the conduit.");
+			return false;
+		}
+		UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(Owner->GetBoundGraph());
 		UAnimGraphNode_TransitionResult* ResultNode = RuleGraph ? RuleGraph->GetResultNode() : nullptr;
 		if (!ResultNode)
 		{
-			OutError = TEXT("Transition has no rule graph result node.");
+			OutError = TEXT("This node has no rule graph result node.");
 			return false;
 		}
 		UEdGraphPin* ResultPin = AnimMCP::FindPin(ResultNode, TEXT("bCanEnterTransition"), TEXT("input"), OutError);
@@ -353,17 +359,20 @@ namespace
 			return false;
 		}
 
-		Transition->Modify();
+		Owner->Modify();
 		RuleGraph->Modify();
 		ResultNode->Modify();
 
-		if (Rule.Kind == ERuleKind::TimeRemaining)
+		if (Transition)
 		{
-			Transition->bAutomaticRuleBasedOnSequencePlayerInState = true;
-			Transition->AutomaticRuleTriggerTime = Rule.TriggerTime;
-			return true;
+			if (Rule.Kind == ERuleKind::TimeRemaining)
+			{
+				Transition->bAutomaticRuleBasedOnSequencePlayerInState = true;
+				Transition->AutomaticRuleTriggerTime = Rule.TriggerTime;
+				return true;
+			}
+			Transition->bAutomaticRuleBasedOnSequencePlayerInState = false;
 		}
-		Transition->bAutomaticRuleBasedOnSequencePlayerInState = false;
 
 		// Replace the rule graph: remove everything except the result node.
 		TArray<UEdGraphNode*> ToRemove;
@@ -434,6 +443,52 @@ namespace
 			return false;
 		}
 		return true;
+	}
+
+	/** True if the state's own graph contains an asset player, which an automatic (time_remaining) rule needs. */
+	bool StateHasAssetPlayer(const UAnimStateNodeBase* State)
+	{
+		const UEdGraph* Graph = State ? State->GetBoundGraph() : nullptr;
+		if (!Graph || !State->IsA<UAnimStateNode>())
+		{
+			return false;
+		}
+		for (const UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && Node->IsA<UAnimGraphNode_AssetPlayerBase>())
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Rules that are accepted but cannot fire as the state machine stands. These are warnings, not errors:
+	 * the caller may still be about to add the missing animation.
+	 */
+	void CollectRuleWarnings(const UAnimStateNodeBase* Owner, ERuleKind Kind, TArray<FString>& OutWarnings)
+	{
+		const UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(Owner);
+		const FString Label = Transition
+			? FString::Printf(TEXT("Transition %s -> %s"),
+				Transition->GetPreviousState() ? *Transition->GetPreviousState()->GetStateName() : TEXT("?"),
+				Transition->GetNextState() ? *Transition->GetNextState()->GetStateName() : TEXT("?"))
+			: FString::Printf(TEXT("Conduit %s"), *Owner->GetStateName());
+
+		if (Kind == ERuleKind::Never)
+		{
+			OutWarnings.Add(FString::Printf(TEXT("%s: the rule is 'never', so it will never be taken."), *Label));
+		}
+		else if (Kind == ERuleKind::TimeRemaining && Transition)
+		{
+			const UAnimStateNodeBase* Source = Transition->GetPreviousState();
+			if (Source && !StateHasAssetPlayer(Source))
+			{
+				OutWarnings.Add(FString::Printf(TEXT("%s: time_remaining waits for the animation in '%s' to end, but that %s has no animation player, so the rule can never fire. Give it an animation with anim_set_state_animation (loop=false for one-shots)."),
+					*Label, *Source->GetStateName(), Source->IsA<UAnimStateConduitNode>() ? TEXT("conduit") : TEXT("state")));
+			}
+		}
 	}
 
 	FString RuleKindToString(ERuleKind Kind)
@@ -929,14 +984,23 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	{
 		return AnimMCP::Fail(Error);
 	}
-	UAnimStateTransitionNode* Transition = AnimMCP::FindNodeOfType<UAnimStateTransitionNode>(AnimBP, transition_guid, Error);
-	if (!Transition)
+	UAnimStateNodeBase* Owner = AnimMCP::FindNodeOfType<UAnimStateNodeBase>(AnimBP, transition_guid, Error);
+	if (!Owner)
 	{
 		return AnimMCP::Fail(Error);
 	}
-	if (Transition->IsBoundGraphShared())
+	UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(Owner);
+	if (!Transition && !Owner->IsA<UAnimStateConduitNode>())
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("Node %s is a state. Pass the node_guid of a transition, or of a conduit to set its entry rule."), *transition_guid));
+	}
+	if (Transition && Transition->IsBoundGraphShared())
 	{
 		return AnimMCP::Fail(TEXT("This transition uses shared rules. Unshare its rules in the editor before editing it here."));
+	}
+	if (!Transition && crossfade_duration >= 0.f)
+	{
+		return AnimMCP::Fail(TEXT("crossfade_duration applies to transitions, not conduits. Leave it at -1."));
 	}
 
 	FRuleRequest Request;
@@ -953,14 +1017,14 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 
 	const FScopedTransaction Transaction(LOCTEXT("SetTransitionRule", "AnimMCP: Set Transition Rule"));
 	AnimBP->Modify();
-	if (crossfade_duration >= 0.f)
+	if (Transition && crossfade_duration >= 0.f)
 	{
 		Transition->Modify();
 		Transition->CrossfadeDuration = crossfade_duration;
 	}
 
 	TArray<UEdGraphNode*> RuleNodes;
-	if (!ApplyRule(AnimBP, Transition, Resolved, RuleNodes, Error))
+	if (!ApplyRule(AnimBP, Owner, Resolved, RuleNodes, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
@@ -973,9 +1037,13 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 	}
 
-	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(Transition, /*bIncludePins*/ false);
+	TArray<FString> Warnings;
+	CollectRuleWarnings(Owner, Resolved.Kind, Warnings);
+
+	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(Owner, /*bIncludePins*/ false);
 	Payload->SetStringField(TEXT("rule"), RuleKindToString(Resolved.Kind));
 	Payload->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+	Payload->SetArrayField(TEXT("warnings"), AnimMCP::ToJsonArray(Warnings));
 	return AnimMCP::Ok(Payload);
 }
 
@@ -1082,6 +1150,8 @@ namespace
 		bool bConduit = false;
 		bool bHasAnimation = false;
 		FStateAnimation Animation;
+		bool bHasRule = false;  // conduits only
+		FResolvedRule Rule;
 		TOptional<FVector2D> Position;
 	};
 
@@ -1350,6 +1420,34 @@ namespace
 			Out.NewVariables.Add(MoveTemp(Variable));
 		}
 
+		// Optional rule fields, shared by transitions and conduits.
+		auto ReadRule = [&](const TSharedPtr<FJsonObject>& Item, const FString& Where, FResolvedRule& OutRule) -> bool
+		{
+			FRuleRequest Request;
+			if (!Read.String(Item, Where, TEXT("rule"), Request.Rule))
+			{
+				return false;
+			}
+			if (!Read.String(Item, Where, TEXT("variable"), Request.VariableName))
+			{
+				Read.String(Item, Where, TEXT("variable_name"), Request.VariableName);
+			}
+			Read.String(Item, Where, TEXT("comparison"), Request.Comparison);
+			Read.Number(Item, Where, TEXT("threshold"), Request.Threshold);
+			double TriggerTime = -1.0;
+			if (Read.Number(Item, Where, TEXT("trigger_time"), TriggerTime))
+			{
+				Request.TriggerTime = (float)TriggerTime;
+			}
+			FString RuleError;
+			if (!ResolveRule(AnimBP, Request, OutRule, RuleError, &Pending))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *RuleError));
+				return false;
+			}
+			return true;
+		};
+
 		// States and conduits share one name space.
 		auto ReadNodes = [&](const TCHAR* Key, bool bConduit)
 		{
@@ -1360,7 +1458,7 @@ namespace
 				const FString Where = FString::Printf(TEXT("%s[%d]"), Key, Index);
 				if (bConduit)
 				{
-					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("x"), TEXT("y") });
+					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("x"), TEXT("y"), TEXT("rule"), TEXT("variable"), TEXT("variable_name"), TEXT("comparison"), TEXT("threshold") });
 				}
 				else
 				{
@@ -1393,7 +1491,15 @@ namespace
 					Node.Position = FVector2D(NodeX, NodeY);
 				}
 
-				if (!bConduit)
+				if (bConduit)
+				{
+					Node.bHasRule = ReadRule(Item, Where, Node.Rule);
+					if (Node.bHasRule && Node.Rule.Kind == ERuleKind::TimeRemaining)
+					{
+						Problems.Add(FString::Printf(TEXT("%s: time_remaining is a transition setting and cannot be a conduit rule."), *Where));
+					}
+				}
+				else
 				{
 					FStateAnimation& Anim = Node.Animation;
 					Read.String(Item, Where, TEXT("animation"), Anim.AssetPath);
@@ -1483,29 +1589,7 @@ namespace
 			}
 			Transition.Crossfade = (float)Crossfade;
 
-			FRuleRequest Request;
-			if (Read.String(Item, Where, TEXT("rule"), Request.Rule))
-			{
-				if (!Read.String(Item, Where, TEXT("variable"), Request.VariableName))
-				{
-					Read.String(Item, Where, TEXT("variable_name"), Request.VariableName);
-				}
-				Read.String(Item, Where, TEXT("comparison"), Request.Comparison);
-				Read.Number(Item, Where, TEXT("threshold"), Request.Threshold);
-				double TriggerTime = -1.0;
-				if (Read.Number(Item, Where, TEXT("trigger_time"), TriggerTime))
-				{
-					Request.TriggerTime = (float)TriggerTime;
-				}
-				if (ResolveRule(AnimBP, Request, Transition.Rule, Error, &Pending))
-				{
-					Transition.bHasRule = true;
-				}
-				else
-				{
-					Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
-				}
-			}
+			Transition.bHasRule = ReadRule(Item, Where, Transition.Rule);
 			Out.Transitions.Add(Transition);
 		}
 
@@ -1596,6 +1680,17 @@ namespace
 					Item->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
 				}
 			}
+			if (Node.bConduit)
+			{
+				TArray<UEdGraphNode*> RuleNodes;
+				if (Node.bHasRule && !ApplyRule(AnimBP, StateNode, Node.Rule, RuleNodes, OutError))
+				{
+					OutError = FString::Printf(TEXT("Conduit '%s': %s"), *Node.Name, *OutError);
+					return false;
+				}
+				Item->SetStringField(TEXT("rule"), Node.bHasRule ? RuleKindToString(Node.Rule.Kind) : FString(TEXT("never")));
+				Item->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+			}
 			(Node.bConduit ? ConduitItems : StateItems).Add(Item);
 		}
 
@@ -1611,6 +1706,7 @@ namespace
 		}
 
 		TArray<TSharedRef<FJsonObject>> TransitionItems;
+		TArray<UAnimStateTransitionNode*> TransitionNodes;
 		for (const FSpecTransition& SpecTransition : Spec.Transitions)
 		{
 			UAnimStateNodeBase* From = Created[SpecTransition.From];
@@ -1634,7 +1730,39 @@ namespace
 			Item->SetStringField(TEXT("rule"), SpecTransition.bHasRule ? RuleKindToString(SpecTransition.Rule.Kind) : FString(TEXT("never")));
 			Item->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
 			TransitionItems.Add(Item);
+			TransitionNodes.Add(Transition);
 		}
+
+		// Warnings: rules that were accepted but cannot fire as built. Checked last, once every state has its animation.
+		TArray<FString> Warnings;
+		for (int32 Index = 0; Index < Spec.Nodes.Num(); ++Index)
+		{
+			if (Spec.Nodes[Index].bConduit)
+			{
+				if (Spec.Nodes[Index].bHasRule)
+				{
+					CollectRuleWarnings(Created[Index], Spec.Nodes[Index].Rule.Kind, Warnings);
+				}
+				else
+				{
+					Warnings.Add(FString::Printf(TEXT("Conduit %s has no rule, so nothing can pass through it. Give it a 'rule' in the spec or set one with anim_set_transition_rule."), *Spec.Nodes[Index].Name));
+				}
+			}
+		}
+		for (int32 Index = 0; Index < Spec.Transitions.Num(); ++Index)
+		{
+			const FSpecTransition& SpecTransition = Spec.Transitions[Index];
+			if (SpecTransition.bHasRule)
+			{
+				CollectRuleWarnings(TransitionNodes[Index], SpecTransition.Rule.Kind, Warnings);
+			}
+			else
+			{
+				Warnings.Add(FString::Printf(TEXT("Transition %s -> %s has no rule, so it will never be taken."),
+					*Spec.Nodes[SpecTransition.From].Name, *Spec.Nodes[SpecTransition.To].Name));
+			}
+		}
+		Payload->SetArrayField(TEXT("warnings"), AnimMCP::ToJsonArray(Warnings));
 
 		Payload->SetObjectField(TEXT("state_machine"), AnimMCP::NodeToJson(MachineNode, /*bIncludePins*/ false));
 		Payload->SetStringField(TEXT("state_machine_graph_guid"), AnimMCP::GuidToString(SMGraph->GraphGuid));
@@ -1682,7 +1810,6 @@ FAnimMCPResult UAnimStateMachineToolset::anim_build_state_machine(const FString&
 			bRolledBack ? TEXT("All changes were rolled back.") : TEXT("Partial changes remain; press Ctrl+Z in the editor to undo them.")));
 	}
 
-	Payload->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
 	return AnimMCP::Ok(Payload);
 }
 
