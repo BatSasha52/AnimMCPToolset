@@ -114,4 +114,15 @@ public:
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
 	static FAnimMCPResult anim_save_asset(const FString& asset_path);
+
+	/**
+	 * Adds or removes a compatible skeleton. Animation assets made for a compatible skeleton can then be used with this one
+	 * (in Animation Blueprints, blend spaces and state animations) without retargeting. Marks the skeleton dirty; save it with anim_save_asset.
+	 * @param skeleton_path The Skeleton to change (must be under /Game). A SkeletalMesh path is accepted and resolves to its skeleton.
+	 * @param compatible_skeleton_path The other Skeleton (may be anywhere, including /Engine or plugin content).
+	 * @param compatible True to add it to the compatible list, false to remove it.
+	 * @return Result: {skeleton, changed, compatible_skeletons}. changed is false if the list already had (or lacked) it.
+	 */
+	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
+	static FAnimMCPResult anim_set_skeleton_compatible(const FString& skeleton_path, const FString& compatible_skeleton_path, bool compatible = true);
 };

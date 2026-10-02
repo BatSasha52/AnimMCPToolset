@@ -615,4 +615,58 @@ FAnimMCPResult UAnimAssetToolset::anim_save_asset(const FString& asset_path)
 	return AnimMCP::Ok(Payload);
 }
 
+FAnimMCPResult UAnimAssetToolset::anim_set_skeleton_compatible(const FString& skeleton_path, const FString& compatible_skeleton_path, bool compatible)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	USkeleton* Skeleton = AnimMCP::ResolveSkeleton(skeleton_path, Error);
+	if (!Skeleton)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	if (!AnimMCP::IsUnderGameRoot(Skeleton->GetPathName()))
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("Refusing to modify '%s': only assets under /Game may be edited."), *Skeleton->GetPathName()));
+	}
+	USkeleton* Other = AnimMCP::ResolveSkeleton(compatible_skeleton_path, Error);
+	if (!Other)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	if (Other == Skeleton)
+	{
+		return AnimMCP::Fail(TEXT("A skeleton is always compatible with itself; pass a different compatible_skeleton_path."));
+	}
+
+	const TSoftObjectPtr<USkeleton> OtherRef(Other);
+	const bool bListed = Skeleton->GetCompatibleSkeletons().Contains(OtherRef);
+	const bool bChange = compatible != bListed;
+	if (bChange)
+	{
+		const FScopedTransaction Transaction(LOCTEXT("SetSkeletonCompatible", "AnimMCP: Set Compatible Skeleton"));
+		Skeleton->Modify();
+		if (compatible)
+		{
+			Skeleton->AddCompatibleSkeleton(Other);
+		}
+		else
+		{
+			Skeleton->RemoveCompatibleSkeleton(Other);
+		}
+		Skeleton->MarkPackageDirty();
+	}
+
+	TArray<FString> Compatible;
+	for (const TSoftObjectPtr<USkeleton>& Entry : Skeleton->GetCompatibleSkeletons())
+	{
+		Compatible.Add(Entry.ToSoftObjectPath().ToString());
+	}
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	Payload->SetBoolField(TEXT("changed"), bChange);
+	Payload->SetArrayField(TEXT("compatible_skeletons"), AnimMCP::ToJsonArray(Compatible));
+	return AnimMCP::Ok(Payload);
+}
+
 #undef LOCTEXT_NAMESPACE

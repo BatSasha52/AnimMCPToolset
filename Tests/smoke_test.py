@@ -229,5 +229,26 @@ if r:
         ignored = [m for m in c["messages"] if "visible but ignored" in m["message"]]
         log("%s 'visible but ignored' names the state: %s" % ("OK  " if ignored and (ignored[0].get("source") or {}).get("state") == "Options" else "FAIL", ignored and ignored[0]["source"].get("location")))
 
+# --- v0.2 step 5: skeleton tools
+r = ok("AnimInspectToolset", "anim_get_skeleton_info", asset_path=SK)
+r and log("%s skeleton info: bones=%d listed=%d sockets=%d virtual=%d compatible=%s slot_groups=%s" % (
+    "OK  " if r["bone_count"] == len(r["bones"]) > 0 else "FAIL", r["bone_count"], len(r["bones"]), len(r["sockets"]), len(r["virtual_bones"]), r["compatible_skeletons"], r["slot_groups"]))
+r = ok("AnimInspectToolset", "anim_get_skeleton_info", asset_path=SK, include_bones=False)
+r and log("%s include_bones=false: %s" % ("OK  " if "bones" not in r and r["bone_count"] > 0 else "FAIL", sorted(r.keys())))
+SK_COPY = "/Game/AMCPTest/SK_Copy"
+unreal.EditorAssetLibrary.duplicate_asset(SK, SK_COPY)
+before = ok("AnimInspectToolset", "anim_list_animation_assets", skeleton_path=SK_COPY, folder="/Engine/Tutorial/SubEditors/TutorialAssets")
+r = ok("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK_COPY, compatible_skeleton_path=SK)
+after = ok("AnimInspectToolset", "anim_list_animation_assets", skeleton_path=SK_COPY, folder="/Engine/Tutorial/SubEditors/TutorialAssets")
+if r and before is not None and after is not None:
+    log("%s compatible skeleton makes anims usable: changed=%s list=%s anims before=%d after=%d" % (
+        "OK  " if r["changed"] and len(before["assets"]) == 0 and len(after["assets"]) > 0 else "FAIL", r["changed"], r["compatible_skeletons"], len(before["assets"]), len(after["assets"])))
+r = ok("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK_COPY, compatible_skeleton_path=SK)
+r and log("%s adding twice is a no-op: changed=%s" % ("OK  " if not r["changed"] else "FAIL", r["changed"]))
+r = ok("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK_COPY, compatible_skeleton_path=SK, compatible=False)
+r and log("%s remove: changed=%s list=%s" % ("OK  " if r["changed"] and r["compatible_skeletons"] == [] else "FAIL", r["changed"], r["compatible_skeletons"]))
+expect_fail("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK, compatible_skeleton_path=SK_COPY)
+expect_fail("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK_COPY, compatible_skeleton_path=SK_COPY)
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

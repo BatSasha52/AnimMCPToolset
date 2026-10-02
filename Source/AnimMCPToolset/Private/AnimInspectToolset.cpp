@@ -17,6 +17,7 @@
 #include "EdGraph/EdGraph.h"
 #include "Engine/Blueprint.h"
 #include "Engine/SkeletalMesh.h"
+#include "Engine/SkeletalMeshSocket.h"
 #include "UObject/UObjectHash.h"
 
 namespace
@@ -379,5 +380,95 @@ FAnimMCPResult UAnimInspectToolset::anim_list_node_types(const FString& filter)
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetArrayField(TEXT("node_types"), AnimMCP::ToJsonArray(Items));
+	return AnimMCP::Ok(Payload);
+}
+
+FAnimMCPResult UAnimInspectToolset::anim_get_skeleton_info(const FString& asset_path, bool include_bones)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	USkeleton* Skeleton = AnimMCP::ResolveSkeleton(asset_path, Error);
+	if (!Skeleton)
+	{
+		return AnimMCP::Fail(Error);
+	}
+
+	auto VectorToJson = [](const FVector& V)
+	{
+		return TArray<TSharedPtr<FJsonValue>>{ MakeShared<FJsonValueNumber>(V.X), MakeShared<FJsonValueNumber>(V.Y), MakeShared<FJsonValueNumber>(V.Z) };
+	};
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+
+	const FReferenceSkeleton& RefSkeleton = Skeleton->GetReferenceSkeleton();
+	Payload->SetNumberField(TEXT("bone_count"), RefSkeleton.GetNum());
+	if (include_bones)
+	{
+		TArray<TSharedRef<FJsonObject>> Bones;
+		for (int32 BoneIndex = 0; BoneIndex < RefSkeleton.GetNum(); ++BoneIndex)
+		{
+			TSharedRef<FJsonObject> Bone = MakeShared<FJsonObject>();
+			Bone->SetNumberField(TEXT("index"), BoneIndex);
+			Bone->SetStringField(TEXT("name"), RefSkeleton.GetBoneName(BoneIndex).ToString());
+			const int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
+			Bone->SetStringField(TEXT("parent"), ParentIndex != INDEX_NONE ? RefSkeleton.GetBoneName(ParentIndex).ToString() : FString());
+			Bones.Add(Bone);
+		}
+		Payload->SetArrayField(TEXT("bones"), AnimMCP::ToJsonArray(Bones));
+	}
+
+	TArray<TSharedRef<FJsonObject>> VirtualBones;
+	for (const FVirtualBone& VirtualBone : Skeleton->GetVirtualBones())
+	{
+		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("name"), VirtualBone.VirtualBoneName.ToString());
+		Item->SetStringField(TEXT("source"), VirtualBone.SourceBoneName.ToString());
+		Item->SetStringField(TEXT("target"), VirtualBone.TargetBoneName.ToString());
+		VirtualBones.Add(Item);
+	}
+	Payload->SetArrayField(TEXT("virtual_bones"), AnimMCP::ToJsonArray(VirtualBones));
+
+	// Skeleton sockets only; sockets added on a skeletal mesh live on the mesh.
+	TArray<TSharedRef<FJsonObject>> Sockets;
+	for (const USkeletalMeshSocket* Socket : Skeleton->Sockets)
+	{
+		if (!Socket)
+		{
+			continue;
+		}
+		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("name"), Socket->SocketName.ToString());
+		Item->SetStringField(TEXT("bone"), Socket->BoneName.ToString());
+		Item->SetArrayField(TEXT("location"), VectorToJson(Socket->RelativeLocation));
+		Item->SetArrayField(TEXT("rotation"), VectorToJson(FVector(Socket->RelativeRotation.Pitch, Socket->RelativeRotation.Yaw, Socket->RelativeRotation.Roll)));
+		Item->SetArrayField(TEXT("scale"), VectorToJson(Socket->RelativeScale));
+		Sockets.Add(Item);
+	}
+	Payload->SetArrayField(TEXT("sockets"), AnimMCP::ToJsonArray(Sockets));
+
+	TArray<FString> Compatible;
+	for (const TSoftObjectPtr<USkeleton>& Other : Skeleton->GetCompatibleSkeletons())
+	{
+		Compatible.Add(Other.ToSoftObjectPath().ToString());
+	}
+	Payload->SetArrayField(TEXT("compatible_skeletons"), AnimMCP::ToJsonArray(Compatible));
+	Payload->SetBoolField(TEXT("use_retarget_modes_from_compatible"), Skeleton->GetUseRetargetModesFromCompatibleSkeleton());
+
+	TArray<TSharedRef<FJsonObject>> SlotGroups;
+	for (const FAnimSlotGroup& Group : Skeleton->GetSlotGroups())
+	{
+		TArray<FString> Slots;
+		for (const FName& Slot : Group.SlotNames)
+		{
+			Slots.Add(Slot.ToString());
+		}
+		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("group"), Group.GroupName.ToString());
+		Item->SetArrayField(TEXT("slots"), AnimMCP::ToJsonArray(Slots));
+		SlotGroups.Add(Item);
+	}
+	Payload->SetArrayField(TEXT("slot_groups"), AnimMCP::ToJsonArray(SlotGroups));
 	return AnimMCP::Ok(Payload);
 }
