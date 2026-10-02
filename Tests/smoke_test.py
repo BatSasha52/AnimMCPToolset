@@ -250,5 +250,26 @@ r and log("%s remove: changed=%s list=%s" % ("OK  " if r["changed"] and r["compa
 expect_fail("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK, compatible_skeleton_path=SK_COPY)
 expect_fail("AnimAssetToolset", "anim_set_skeleton_compatible", skeleton_path=SK_COPY, compatible_skeleton_path=SK_COPY)
 
+# --- v0.2 step 7: add_locomotion_vars
+BP3 = "/Game/AMCPTest/ABP_Loco"
+r = ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Loco", skeleton_path=SK, add_locomotion_vars=True)
+r and log("%s locomotion setup: vars=%s nodes=%d" % ("OK  " if r.get("locomotion_variables") == ["Speed", "IsMoving", "IsFalling"] and len(r.get("locomotion_nodes", [])) >= 14 else "FAIL", r.get("locomotion_variables"), len(r.get("locomotion_nodes", []))))
+r = ok("AnimInspectToolset", "anim_list_variables", blueprint_path=BP3)
+r and log("%s locomotion vars: %s" % ("OK  " if [(v["name"], v["category"]) for v in r["variables"]] == [("Speed", "Locomotion"), ("IsMoving", "Locomotion"), ("IsFalling", "Locomotion")] else "FAIL", [(v["name"], v["type"]) for v in r["variables"]]))
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP3, graph="EventGraph", include_pins=True)
+if r:
+    ev = [n for n in r["nodes"] if n["class"] == "K2Node_Event"]
+    then_links = [p["linked_to"] for p in ev[0]["pins"] if p["name"] == "then"] if ev else []
+    log("%s update event wired: events=%d then_links=%s titles=%s" % ("OK  " if len(ev) == 1 and then_links and then_links[0] else "FAIL", len(ev), then_links, sorted(n["title"] for n in r["nodes"])))
+r = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP3); r and log("%s compile locomotion ABP: errors=%d warnings=%d msgs=%s" % ("OK  " if r["num_errors"] == 0 and r["num_warnings"] == 0 else "FAIL", r["num_errors"], r["num_warnings"], r["messages"][:3]))
+spec7 = {"name": "Loco", "connect_to_output": True, "states": [{"name": "Idle", "animation": IDLE}, {"name": "Walk", "animation": WALK}],
+         "transitions": [{"from": "Idle", "to": "Walk", "rule": "bool_variable", "variable": "IsMoving"}, {"from": "Walk", "to": "Idle", "rule": "compare", "variable": "Speed", "comparison": "<", "threshold": 3}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP3, spec=json.dumps(spec7))
+r and log("%s state machine on locomotion vars: warnings=%s" % ("OK  " if r["warnings"] == [] else "FAIL", r["warnings"]))
+r = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP3); r and log("%s compile full locomotion ABP: errors=%d warnings=%d" % ("OK  " if r["num_errors"] == 0 and r["num_warnings"] == 0 else "FAIL", r["num_errors"], r["num_warnings"]))
+expect_fail("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_LocoChild", skeleton_path=SK, parent_class=BP3, add_locomotion_vars=True)
+r = ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Plain", skeleton_path=SK)
+r and log("%s default create has no locomotion setup: %s" % ("OK  " if "locomotion_variables" not in r else "FAIL", sorted(r.keys())))
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

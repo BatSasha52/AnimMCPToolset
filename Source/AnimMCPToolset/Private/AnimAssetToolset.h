@@ -28,10 +28,14 @@ public:
 	 * @param skeleton_path Path of the target Skeleton, or of a SkeletalMesh whose skeleton to use.
 	 * @param parent_class Parent AnimInstance class: a class name ('AnimInstance'), a class path ('/Script/MyGame.MyAnimInstance'), or another Animation Blueprint path.
 	 * @param preview_mesh_path SkeletalMesh to use as the editor preview mesh. 'none' = leave unset.
-	 * @return Result: {path, skeleton, parent_class}.
+	 * @param add_locomotion_vars If true, also adds float Speed, bool IsMoving and bool IsFalling (category Locomotion) and wires the EventGraph
+	 *        to fill them every frame from the owning pawn: Speed = horizontal velocity, IsMoving = Speed > 3, IsFalling = the pawn's movement component
+	 *        IsFalling. Uses only Pawn and movement component API, so it works for any pawn, not only Characters. Fails if the parent class already has those names.
+	 * @return Result: {path, skeleton, parent_class, saved, locomotion_variables, locomotion_nodes}.
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
-	static FAnimMCPResult anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class = TEXT("AnimInstance"), const FString& preview_mesh_path = TEXT("none"));
+	static FAnimMCPResult anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class = TEXT("AnimInstance"), const FString& preview_mesh_path = TEXT("none"),
+		bool add_locomotion_vars = false);
 
 	/**
 	 * Adds a member variable to an Animation Blueprint (e.g. a bool 'bIsInAir' or float 'Speed' to drive transitions and blends).
