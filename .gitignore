@@ -1,0 +1,45 @@
+# Unreal build output
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+Build/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.idea/
+*.VC.db
+*.VC.opendb
+*.opensdf
+*.sdf
+*.suo
+*.sln
+*.slnx
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.xcodeproj
+*.xcworkspace
+
+# Compiled artifacts
+*.dll
+*.exe
+*.lib
+*.pdb
+*.obj
+*.o
+*.so
+*.dylib
+*.target
+*.modules
+*.ilk
+*.exp
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
