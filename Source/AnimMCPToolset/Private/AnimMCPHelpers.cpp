@@ -65,6 +65,21 @@ namespace AnimMCP
 		return false;
 	}
 
+	bool NormalizeFolder(const FString& InFolder, FString& OutFolder, FString& OutError)
+	{
+		OutFolder = IsUnset(InFolder) ? FString(TEXT("/Game")) : InFolder.TrimStartAndEnd();
+		while (OutFolder.Len() > 1 && OutFolder.EndsWith(TEXT("/")))
+		{
+			OutFolder.LeftChopInline(1);
+		}
+		if (!OutFolder.StartsWith(TEXT("/")) || OutFolder.Len() < 2)
+		{
+			OutError = FString::Printf(TEXT("'%s' is not a content folder. Use a path such as '/Game' or '/Game/Characters'."), *InFolder);
+			return false;
+		}
+		return true;
+	}
+
 	void EnsureFolderScanned(const FString& Folder)
 	{
 		if (Folder.StartsWith(TEXT("/")))
@@ -716,6 +731,31 @@ namespace AnimMCP
 		else
 		{
 			OutError = FString::Printf(TEXT("Unsupported variable type '%s'. Supported: bool, byte, int, int64, float, name, string, text, vector, vector2d, rotator, transform, linearcolor, object:<class path>."), *TypeString);
+			return false;
+		}
+		return true;
+	}
+
+	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError)
+	{
+		if (Value.IsEmpty())
+		{
+			return true;
+		}
+		if (!ValidateBoolText(PinType, Value, OutError))
+		{
+			return false;
+		}
+		const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+		FString UseDefaultValue;
+		TObjectPtr<UObject> UseDefaultObject = nullptr;
+		FText UseDefaultText;
+		K2Schema->GetPinDefaultValuesFromString(PinType, nullptr, Value, UseDefaultValue, UseDefaultObject, UseDefaultText);
+
+		FString Message;
+		if (!K2Schema->DefaultValueSimpleValidation(PinType, VarName, UseDefaultValue, UseDefaultObject, UseDefaultText, &Message))
+		{
+			OutError = FString::Printf(TEXT("Invalid default '%s' for %s: %s"), *Value, *PinTypeToString(PinType), *Message);
 			return false;
 		}
 		return true;

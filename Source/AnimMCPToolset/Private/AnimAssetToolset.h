@@ -28,10 +28,14 @@ public:
 	 * @param skeleton_path Path of the target Skeleton, or of a SkeletalMesh whose skeleton to use.
 	 * @param parent_class Parent AnimInstance class: a class name ('AnimInstance'), a class path ('/Script/MyGame.MyAnimInstance'), or another Animation Blueprint path.
 	 * @param preview_mesh_path SkeletalMesh to use as the editor preview mesh. 'none' = leave unset.
-	 * @return Result: {path, skeleton, parent_class}.
+	 * @param add_locomotion_vars If true, also adds float Speed, bool IsMoving and bool IsFalling (category Locomotion) and wires the EventGraph
+	 *        to fill them every frame from the owning pawn: Speed = horizontal velocity, IsMoving = Speed > 3, IsFalling = the pawn's movement component
+	 *        IsFalling. Uses only Pawn and movement component API, so it works for any pawn, not only Characters. Fails if the parent class already has those names.
+	 * @return Result: {path, skeleton, parent_class, saved, locomotion_variables, locomotion_nodes}.
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
-	static FAnimMCPResult anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class = TEXT("AnimInstance"), const FString& preview_mesh_path = TEXT("none"));
+	static FAnimMCPResult anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class = TEXT("AnimInstance"), const FString& preview_mesh_path = TEXT("none"),
+		bool add_locomotion_vars = false);
 
 	/**
 	 * Adds a member variable to an Animation Blueprint (e.g. a bool 'bIsInAir' or float 'Speed' to drive transitions and blends).
@@ -100,7 +104,9 @@ public:
 	/**
 	 * Compiles an Animation Blueprint and reports errors and warnings. Does not save.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
-	 * @return Result: {status, num_errors, num_warnings, messages: [{severity, message}]}. Success is true even when the blueprint has compile errors; check num_errors.
+	 * @return Result: {status, num_errors, num_warnings, messages: [{severity, message, source}]}. Success is true even when the blueprint has compile errors; check num_errors.
+	 *         source (when the message names a node): {node_guid, node_title, node_class, graph, graph_guid, pin, state_machine, state, transition (+ their _guid), location},
+	 *         where location reads like 'AnimGraph > state machine Locomotion > state JumpUp > Sequence Player'.
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
 	static FAnimMCPResult anim_compile_blueprint(const FString& blueprint_path);
@@ -112,4 +118,15 @@ public:
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
 	static FAnimMCPResult anim_save_asset(const FString& asset_path);
+
+	/**
+	 * Adds or removes a compatible skeleton. Animation assets made for a compatible skeleton can then be used with this one
+	 * (in Animation Blueprints, blend spaces and state animations) without retargeting. Marks the skeleton dirty; save it with anim_save_asset.
+	 * @param skeleton_path The Skeleton to change (must be under /Game). A SkeletalMesh path is accepted and resolves to its skeleton.
+	 * @param compatible_skeleton_path The other Skeleton (may be anywhere, including /Engine or plugin content).
+	 * @param compatible True to add it to the compatible list, false to remove it.
+	 * @return Result: {skeleton, changed, compatible_skeletons}. changed is false if the list already had (or lacked) it.
+	 */
+	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
+	static FAnimMCPResult anim_set_skeleton_compatible(const FString& skeleton_path, const FString& compatible_skeleton_path, bool compatible = true);
 };

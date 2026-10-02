@@ -74,6 +74,17 @@ public:
 	static FAnimMCPResult anim_list_skeleton_bones(const FString& asset_path);
 
 	/**
+	 * Describes a skeleton: bones, virtual bones, sockets, compatible skeletons and montage slot groups. Read-only.
+	 * Use it to check why animations do not show up for a mesh (compatible_skeletons) or which slot names a Slot node can use.
+	 * @param asset_path Path of a Skeleton, SkeletalMesh, AnimBlueprint or animation asset; its skeleton is used.
+	 * @param include_bones If false, bones are counted but not listed (useful for large skeletons).
+	 * @return Result: {skeleton, bone_count, bones: [{index, name, parent}], virtual_bones: [{name, source, target}],
+	 *         sockets: [{name, bone, location, rotation, scale}], compatible_skeletons, use_retarget_modes_from_compatible, slot_groups: [{group, slots}]}.
+	 */
+	UFUNCTION(Category = "AnimMCP|Inspect", meta = (AICallable))
+	static FAnimMCPResult anim_get_skeleton_info(const FString& asset_path, bool include_bones = true);
+
+	/**
 	 * Lists animation assets (sequences, montages, blend spaces, aim offsets, ...) compatible with a skeleton.
 	 * @param skeleton_path Path of a Skeleton, SkeletalMesh or AnimBlueprint whose skeleton to match.
 	 * @param folder Content folder to search recursively.

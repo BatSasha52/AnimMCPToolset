@@ -37,6 +37,12 @@ namespace AnimMCP
 	/** Bool pins/variables accept only true/false (the K2 validator accepts anything). */
 	bool ValidateBoolText(const FEdGraphPinType& PinType, const FString& Value, FString& OutError);
 
+	/**
+	 * Normalizes a content folder for asset registry queries: unset -> "/Game", trailing slashes removed.
+	 * The registry matches package paths exactly, so "/Game/Characters/" would otherwise find nothing.
+	 */
+	bool NormalizeFolder(const FString& InFolder, FString& OutFolder, FString& OutError);
+
 	/** Makes sure the asset registry has scanned a folder before it is queried. */
 	void EnsureFolderScanned(const FString& Folder);
 
@@ -131,6 +137,9 @@ namespace AnimMCP
 
 	/** Parses a type string such as "bool", "float", "vector", "object:/Script/Engine.AnimSequence". */
 	bool ParsePinType(const FString& TypeString, FEdGraphPinType& OutType, FString& OutError);
+
+	/** Validates a variable default value string for a pin type using the K2 schema. Empty is always valid. */
+	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError);
 
 	TArray<TSharedPtr<FJsonValue>> ToJsonArray(const TArray<TSharedRef<FJsonObject>>& Objects);
 	TArray<TSharedPtr<FJsonValue>> ToJsonArray(const TArray<FString>& Strings);

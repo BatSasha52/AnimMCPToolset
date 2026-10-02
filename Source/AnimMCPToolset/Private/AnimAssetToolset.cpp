@@ -5,6 +5,11 @@
 #include "AnimMCPHelpers.h"
 
 #include "Animation/AnimBlueprint.h"
+#include "AnimGraphNode_StateMachineBase.h"
+#include "AnimStateConduitNode.h"
+#include "AnimStateNodeBase.h"
+#include "AnimStateTransitionNode.h"
+#include "AnimationStateMachineGraph.h"
 #include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimSequence.h"
@@ -13,6 +18,16 @@
 #include "Animation/Skeleton.h"
 #include "AssetToolsModule.h"
 #include "EdGraphSchema_K2.h"
+#include "GameFramework/NavMovementComponent.h"
+#include "GameFramework/Pawn.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_Event.h"
+#include "K2Node_IfThenElse.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "EdGraphToken.h"
 #include "Engine/SkeletalMesh.h"
 #include "Factories/AnimBlueprintFactory.h"
 #include "Factories/BlendSpaceFactory1D.h"
@@ -23,6 +38,7 @@
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "Misc/StringOutputDevice.h"
+#include "Misc/UObjectToken.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
 
@@ -77,29 +93,322 @@ namespace
 		return Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass.Get() : Blueprint->GeneratedClass.Get();
 	}
 
-	/** Validates a default value string for a pin type using the K2 schema. */
-	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError)
+	/** Fills state machine context (state machine, state, transition) for a node by walking up its graphs. */
+	void AddGraphContext(const UEdGraphNode* Node, const TSharedRef<FJsonObject>& Json, TArray<FString>& Path)
 	{
-		if (Value.IsEmpty())
+		auto Describe = [&Json, &Path](const UEdGraphNode* Owner)
 		{
-			return true;
-		}
-		if (!AnimMCP::ValidateBoolText(PinType, Value, OutError))
-		{
-			return false;
-		}
-		const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
-		FString UseDefaultValue;
-		TObjectPtr<UObject> UseDefaultObject = nullptr;
-		FText UseDefaultText;
-		K2Schema->GetPinDefaultValuesFromString(PinType, nullptr, Value, UseDefaultValue, UseDefaultObject, UseDefaultText);
+			if (const UAnimStateTransitionNode* Transition = Cast<UAnimStateTransitionNode>(Owner))
+			{
+				const FString Label = FString::Printf(TEXT("%s -> %s"),
+					Transition->GetPreviousState() ? *Transition->GetPreviousState()->GetStateName() : TEXT("?"),
+					Transition->GetNextState() ? *Transition->GetNextState()->GetStateName() : TEXT("?"));
+				if (!Json->HasField(TEXT("transition")))
+				{
+					Json->SetStringField(TEXT("transition"), Label);
+					Json->SetStringField(TEXT("transition_guid"), AnimMCP::GuidToString(Transition->NodeGuid));
+				}
+				Path.Insert(TEXT("transition ") + Label, 0);
+			}
+			else if (const UAnimStateNodeBase* State = Cast<UAnimStateNodeBase>(Owner))
+			{
+				if (!Json->HasField(TEXT("state")))
+				{
+					Json->SetStringField(TEXT("state"), State->GetStateName());
+					Json->SetStringField(TEXT("state_guid"), AnimMCP::GuidToString(State->NodeGuid));
+				}
+				Path.Insert(FString::Printf(TEXT("%s %s"), State->IsA<UAnimStateConduitNode>() ? TEXT("conduit") : TEXT("state"), *State->GetStateName()), 0);
+			}
+			else if (const UAnimGraphNode_StateMachineBase* Machine = Cast<UAnimGraphNode_StateMachineBase>(Owner))
+			{
+				const FString Name = Machine->EditorStateMachineGraph ? Machine->EditorStateMachineGraph->GetName() : Machine->GetName();
+				if (!Json->HasField(TEXT("state_machine")))
+				{
+					Json->SetStringField(TEXT("state_machine"), Name);
+					Json->SetStringField(TEXT("state_machine_guid"), AnimMCP::GuidToString(Machine->NodeGuid));
+				}
+				Path.Insert(TEXT("state machine ") + Name, 0);
+			}
+		};
 
-		FString Message;
-		if (!K2Schema->DefaultValueSimpleValidation(PinType, VarName, UseDefaultValue, UseDefaultObject, UseDefaultText, &Message))
+		// The node itself may be a state, conduit or transition (e.g. "will never be taken").
+		Describe(Node);
+		const UEdGraph* Graph = Node->GetGraph();
+		while (Graph)
 		{
-			OutError = FString::Printf(TEXT("Invalid default '%s' for %s: %s"), *Value, *AnimMCP::PinTypeToString(PinType), *Message);
+			const UEdGraphNode* Owner = Cast<UEdGraphNode>(Graph->GetOuter());
+			if (!Owner)
+			{
+				Path.Insert(Graph->GetName(), 0);
+				break;
+			}
+			Describe(Owner);
+			Graph = Owner->GetGraph();
+		}
+	}
+
+	/** The node (and pin) a compiler message points at, with its place in the blueprint. Null if the message names no node. */
+	TSharedPtr<FJsonObject> DescribeMessageSource(const FTokenizedMessage& Message)
+	{
+		for (const TSharedRef<IMessageToken>& Token : Message.GetMessageTokens())
+		{
+			const UObject* Object = nullptr;
+			const UEdGraphPin* Pin = nullptr;
+			if (Token->GetType() == EMessageToken::EdGraph)
+			{
+				const FEdGraphToken& GraphToken = static_cast<const FEdGraphToken&>(Token.Get());
+				Object = GraphToken.GetGraphObject();
+				Pin = GraphToken.GetPin();
+				if (!Object && Pin)
+				{
+					Object = Pin->GetOwningNodeUnchecked();
+				}
+			}
+			else if (Token->GetType() == EMessageToken::Object)
+			{
+				Object = static_cast<const FUObjectToken&>(Token.Get()).GetObject().Get();
+			}
+
+			const UEdGraphNode* Node = Cast<UEdGraphNode>(Object);
+			if (!Node)
+			{
+				continue;
+			}
+			TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+			Json->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Node->NodeGuid));
+			Json->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+			Json->SetStringField(TEXT("node_class"), Node->GetClass()->GetName());
+			if (const UEdGraph* Graph = Node->GetGraph())
+			{
+				Json->SetStringField(TEXT("graph"), Graph->GetName());
+				Json->SetStringField(TEXT("graph_guid"), AnimMCP::GuidToString(Graph->GraphGuid));
+			}
+			if (Pin)
+			{
+				Json->SetStringField(TEXT("pin"), Pin->PinName.ToString());
+			}
+			TArray<FString> Path;
+			AddGraphContext(Node, Json, Path);
+			if (!Node->IsA<UAnimStateNodeBase>())
+			{
+				Path.Add(Json->GetStringField(TEXT("node_title")));
+			}
+			Json->SetStringField(TEXT("location"), FString::Join(Path, TEXT(" > ")));
+			return Json;
+		}
+		return nullptr;
+	}
+
+	// ---- Locomotion starter variables ----------------------------------------------------
+
+	const TCHAR* const LocomotionVariableNames[] = { TEXT("Speed"), TEXT("IsMoving"), TEXT("IsFalling") };
+
+	/** Speed below which IsMoving is false, in cm/s. Small enough for slow walks, large enough to ignore jitter. */
+	constexpr double IsMovingThreshold = 3.0;
+
+	/** The parent class must not already define the starter variables. */
+	bool CheckLocomotionVariables(const UClass* ParentClass, FString& OutError)
+	{
+		for (const TCHAR* Name : LocomotionVariableNames)
+		{
+			if (ParentClass && FindFProperty<FProperty>(ParentClass, Name))
+			{
+				OutError = FString::Printf(TEXT("add_locomotion_vars: the parent class %s already has a property named '%s'. Create the blueprint without add_locomotion_vars and use the inherited variables."), *ParentClass->GetName(), Name);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** Turns the editor's disabled placeholder nodes (Event Blueprint Update Animation, Try Get Pawn Owner) into live nodes. */
+	void EnableGhostNode(UEdGraphNode* Node)
+	{
+		if (Node->IsAutomaticallyPlacedGhostNode())
+		{
+			Node->Modify();
+			Node->SetEnabledState(ENodeEnabledState::Enabled, /*bUserAction*/ false);
+			Node->NodeComment.Empty();
+		}
+	}
+
+	/**
+	 * Adds Speed, IsMoving and IsFalling and fills them every frame from the owning pawn:
+	 *   Event Blueprint Update Animation -> Branch(IsValid(TryGetPawnOwner))
+	 *     -> Speed = VSizeXY(Pawn.GetVelocity) -> IsMoving = Speed > threshold
+	 *     -> Branch(IsValid(Pawn.GetMovementComponent)) -> IsFalling = MovementComponent.IsFalling
+	 * Only APawn / UNavMovementComponent API is used, so any pawn works, not just Characters. The caller owns the transaction.
+	 */
+	bool AddLocomotionSetup(UAnimBlueprint* AnimBP, TArray<FString>& OutNodeGuids, FString& OutError)
+	{
+		FEdGraphPinType FloatType;
+		FloatType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		FloatType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+		FEdGraphPinType BoolType;
+		BoolType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+
+		AnimBP->Modify();
+		for (const TCHAR* Name : LocomotionVariableNames)
+		{
+			const bool bIsSpeed = FCString::Strcmp(Name, TEXT("Speed")) == 0;
+			if (!FBlueprintEditorUtils::AddMemberVariable(AnimBP, Name, bIsSpeed ? FloatType : BoolType, bIsSpeed ? TEXT("0.0") : TEXT("false")))
+			{
+				OutError = FString::Printf(TEXT("Failed to add variable '%s'."), Name);
+				return false;
+			}
+			FBlueprintEditorUtils::SetBlueprintVariableCategory(AnimBP, Name, nullptr, FText::FromString(TEXT("Locomotion")));
+		}
+		// Regenerates the skeleton class so the getters and setters below get their value pins.
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+
+		UEdGraph* EventGraph = FBlueprintEditorUtils::FindEventGraph(AnimBP);
+		if (!EventGraph)
+		{
+			OutError = TEXT("The blueprint has no EventGraph.");
 			return false;
 		}
+		const UEdGraphSchema* Schema = EventGraph->GetSchema();
+
+		const FName UpdateEventName = GET_FUNCTION_NAME_CHECKED(UAnimInstance, BlueprintUpdateAnimation);
+		UK2Node_Event* Event = FBlueprintEditorUtils::FindOverrideForFunction(AnimBP, UAnimInstance::StaticClass(), UpdateEventName);
+		if (!Event)
+		{
+			int32 NodePosY = 0;
+			Event = FKismetEditorUtilities::AddDefaultEventNode(AnimBP, EventGraph, UpdateEventName, UAnimInstance::StaticClass(), NodePosY);
+		}
+		if (!Event || Event->GetGraph() != EventGraph)
+		{
+			OutError = TEXT("Could not find or create Event Blueprint Update Animation in the EventGraph.");
+			return false;
+		}
+		EnableGhostNode(Event);
+		UEdGraphPin* EventThen = Event->FindPin(UEdGraphSchema_K2::PN_Then);
+		if (!EventThen || !EventThen->LinkedTo.IsEmpty())
+		{
+			OutError = TEXT("Event Blueprint Update Animation is already wired; add_locomotion_vars only sets up a fresh blueprint.");
+			return false;
+		}
+
+		const FVector2D Origin(Event->NodePosX, Event->NodePosY);
+		TArray<UEdGraphNode*> Created;
+		auto Call = [&](UClass* Owner, FName FunctionName, const FVector2D& Offset) -> UEdGraphNode*
+		{
+			UFunction* Function = Owner->FindFunctionByName(FunctionName);
+			if (!Function)
+			{
+				return nullptr;
+			}
+			UEdGraphNode* Node = AnimMCP::SpawnNode(EventGraph, UK2Node_CallFunction::StaticClass(), Origin + Offset, [Function](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_CallFunction>(NewNode)->SetFromFunction(Function);
+			});
+			Created.Add(Node);
+			return Node;
+		};
+		auto Variable = [&](UClass* NodeClass, const TCHAR* Name, const FVector2D& Offset) -> UEdGraphNode*
+		{
+			UEdGraphNode* Node = AnimMCP::SpawnNode(EventGraph, NodeClass, Origin + Offset, [Name](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_Variable>(NewNode)->VariableReference.SetSelfMember(Name);
+			});
+			Created.Add(Node);
+			return Node;
+		};
+		auto Branch = [&](const FVector2D& Offset) -> UK2Node_IfThenElse*
+		{
+			UEdGraphNode* Node = AnimMCP::SpawnNode(EventGraph, UK2Node_IfThenElse::StaticClass(), Origin + Offset);
+			Created.Add(Node);
+			return CastChecked<UK2Node_IfThenElse>(Node);
+		};
+
+		// Reuse the editor's placeholder Try Get Pawn Owner if it is there.
+		UEdGraphNode* PawnNode = nullptr;
+		const FName TryGetPawnOwnerName = GET_FUNCTION_NAME_CHECKED(UAnimInstance, TryGetPawnOwner);
+		for (UEdGraphNode* Node : EventGraph->Nodes)
+		{
+			const UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+			if (CallNode && CallNode->GetTargetFunction() && CallNode->GetTargetFunction()->GetFName() == TryGetPawnOwnerName)
+			{
+				PawnNode = Node;
+				EnableGhostNode(Node);
+				break;
+			}
+		}
+		if (!PawnNode)
+		{
+			PawnNode = Call(UAnimInstance::StaticClass(), TryGetPawnOwnerName, FVector2D(0.0, 200.0));
+		}
+
+		UEdGraphNode* PawnValid = Call(UKismetSystemLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetSystemLibrary, IsValid), FVector2D(250.0, 200.0));
+		UK2Node_IfThenElse* PawnBranch = Branch(FVector2D(450.0, 0.0));
+		UEdGraphNode* Velocity = Call(AActor::StaticClass(), GET_FUNCTION_NAME_CHECKED(AActor, GetVelocity), FVector2D(250.0, 350.0));
+		UEdGraphNode* SpeedXY = Call(UKismetMathLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, VSizeXY), FVector2D(500.0, 350.0));
+		UEdGraphNode* SetSpeed = Variable(UK2Node_VariableSet::StaticClass(), TEXT("Speed"), FVector2D(700.0, 0.0));
+		UEdGraphNode* GetSpeed = Variable(UK2Node_VariableGet::StaticClass(), TEXT("Speed"), FVector2D(750.0, 250.0));
+		UEdGraphNode* Greater = Call(UKismetMathLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Greater_DoubleDouble), FVector2D(950.0, 250.0));
+		UEdGraphNode* SetMoving = Variable(UK2Node_VariableSet::StaticClass(), TEXT("IsMoving"), FVector2D(1150.0, 0.0));
+		UEdGraphNode* Movement = Call(APawn::StaticClass(), GET_FUNCTION_NAME_CHECKED(APawn, GetMovementComponent), FVector2D(1150.0, 350.0));
+		UEdGraphNode* MovementValid = Call(UKismetSystemLibrary::StaticClass(), GET_FUNCTION_NAME_CHECKED(UKismetSystemLibrary, IsValid), FVector2D(1450.0, 250.0));
+		UK2Node_IfThenElse* MovementBranch = Branch(FVector2D(1650.0, 0.0));
+		UEdGraphNode* Falling = Call(UNavMovementComponent::StaticClass(), GET_FUNCTION_NAME_CHECKED(UNavMovementComponent, IsFalling), FVector2D(1650.0, 350.0));
+		UEdGraphNode* SetFalling = Variable(UK2Node_VariableSet::StaticClass(), TEXT("IsFalling"), FVector2D(1900.0, 0.0));
+		for (const UEdGraphNode* Node : Created)
+		{
+			if (!Node)
+			{
+				OutError = TEXT("A function used by the locomotion setup was not found in this engine version.");
+				return false;
+			}
+		}
+
+		// Every link is checked so a failure names exactly what could not be wired.
+		struct FLink { UEdGraphNode* From; FName FromPin; UEdGraphNode* To; FName ToPin; };
+		const FLink Links[] =
+		{
+			{ Event, UEdGraphSchema_K2::PN_Then, PawnBranch, UEdGraphSchema_K2::PN_Execute },
+			{ PawnNode, UEdGraphSchema_K2::PN_ReturnValue, PawnValid, TEXT("Object") },
+			{ PawnValid, UEdGraphSchema_K2::PN_ReturnValue, PawnBranch, UEdGraphSchema_K2::PN_Condition },
+			{ PawnBranch, UEdGraphSchema_K2::PN_Then, SetSpeed, UEdGraphSchema_K2::PN_Execute },
+			{ PawnNode, UEdGraphSchema_K2::PN_ReturnValue, Velocity, UEdGraphSchema_K2::PN_Self },
+			{ Velocity, UEdGraphSchema_K2::PN_ReturnValue, SpeedXY, TEXT("A") },
+			{ SpeedXY, UEdGraphSchema_K2::PN_ReturnValue, SetSpeed, TEXT("Speed") },
+			{ SetSpeed, UEdGraphSchema_K2::PN_Then, SetMoving, UEdGraphSchema_K2::PN_Execute },
+			{ GetSpeed, TEXT("Speed"), Greater, TEXT("A") },
+			{ Greater, UEdGraphSchema_K2::PN_ReturnValue, SetMoving, TEXT("IsMoving") },
+			{ SetMoving, UEdGraphSchema_K2::PN_Then, MovementBranch, UEdGraphSchema_K2::PN_Execute },
+			{ PawnNode, UEdGraphSchema_K2::PN_ReturnValue, Movement, UEdGraphSchema_K2::PN_Self },
+			{ Movement, UEdGraphSchema_K2::PN_ReturnValue, MovementValid, TEXT("Object") },
+			{ MovementValid, UEdGraphSchema_K2::PN_ReturnValue, MovementBranch, UEdGraphSchema_K2::PN_Condition },
+			{ MovementBranch, UEdGraphSchema_K2::PN_Then, SetFalling, UEdGraphSchema_K2::PN_Execute },
+			{ Movement, UEdGraphSchema_K2::PN_ReturnValue, Falling, UEdGraphSchema_K2::PN_Self },
+			{ Falling, UEdGraphSchema_K2::PN_ReturnValue, SetFalling, TEXT("IsFalling") },
+		};
+		for (const FLink& Link : Links)
+		{
+			UEdGraphPin* FromPin = Link.From->FindPin(Link.FromPin, EGPD_Output);
+			UEdGraphPin* ToPin = Link.To->FindPin(Link.ToPin, EGPD_Input);
+			if (!FromPin || !ToPin || !Schema->TryCreateConnection(FromPin, ToPin))
+			{
+				OutError = FString::Printf(TEXT("Failed to wire %s.%s -> %s.%s in the EventGraph."),
+					*Link.From->GetNodeTitle(ENodeTitleType::ListView).ToString(), *Link.FromPin.ToString(),
+					*Link.To->GetNodeTitle(ENodeTitleType::ListView).ToString(), *Link.ToPin.ToString());
+				return false;
+			}
+		}
+		if (UEdGraphPin* Threshold = Greater->FindPin(TEXT("B"), EGPD_Input))
+		{
+			Schema->TrySetDefaultValue(*Threshold, FString::SanitizeFloat(IsMovingThreshold));
+		}
+
+		OutNodeGuids.Add(AnimMCP::GuidToString(Event->NodeGuid));
+		OutNodeGuids.Add(AnimMCP::GuidToString(PawnNode->NodeGuid));
+		for (const UEdGraphNode* Node : Created)
+		{
+			if (Node != PawnNode)
+			{
+				OutNodeGuids.Add(AnimMCP::GuidToString(Node->NodeGuid));
+			}
+		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 		return true;
 	}
 
@@ -143,7 +452,7 @@ namespace
 	}
 }
 
-FAnimMCPResult UAnimAssetToolset::anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class, const FString& preview_mesh_path)
+FAnimMCPResult UAnimAssetToolset::anim_create_anim_blueprint(const FString& folder, const FString& asset_name, const FString& skeleton_path, const FString& parent_class, const FString& preview_mesh_path, bool add_locomotion_vars)
 {
 	ANIMMCP_REQUIRE_GAME_THREAD();
 
@@ -177,6 +486,11 @@ FAnimMCPResult UAnimAssetToolset::anim_create_anim_blueprint(const FString& fold
 		}
 	}
 
+	if (add_locomotion_vars && !CheckLocomotionVariables(ParentClass, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+
 	UAnimBlueprintFactory* Factory = NewObject<UAnimBlueprintFactory>();
 	Factory->BlueprintType = BPTYPE_Normal;
 	Factory->ParentClass = ParentClass;
@@ -191,11 +505,28 @@ FAnimMCPResult UAnimAssetToolset::anim_create_anim_blueprint(const FString& fold
 	}
 	AnimBP->MarkPackageDirty();
 
+	TArray<FString> LocomotionNodes;
+	if (add_locomotion_vars && !AddLocomotionSetup(AnimBP, LocomotionNodes, Error))
+	{
+		// The asset exists in memory but is unsaved; it is not deleted (assets are never deleted by this plugin).
+		return AnimMCP::Fail(FString::Printf(TEXT("Animation Blueprint created at '%s' but the locomotion setup failed: %s Ctrl+Z undoes the partial setup."), *AnimBP->GetPathName(), *Error));
+	}
+
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("path"), AnimBP->GetPathName());
 	Payload->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
 	Payload->SetStringField(TEXT("parent_class"), ParentClass->GetPathName());
 	Payload->SetBoolField(TEXT("saved"), false);
+	if (add_locomotion_vars)
+	{
+		TArray<FString> Names;
+		for (const TCHAR* Name : LocomotionVariableNames)
+		{
+			Names.Add(Name);
+		}
+		Payload->SetArrayField(TEXT("locomotion_variables"), AnimMCP::ToJsonArray(Names));
+		Payload->SetArrayField(TEXT("locomotion_nodes"), AnimMCP::ToJsonArray(LocomotionNodes));
+	}
 	return AnimMCP::Ok(Payload);
 }
 
@@ -228,7 +559,7 @@ FAnimMCPResult UAnimAssetToolset::anim_add_variable(const FString& blueprint_pat
 	{
 		return AnimMCP::Fail(Error);
 	}
-	if (!ValidateDefaultValue(PinType, VarName, default_value, Error))
+	if (!AnimMCP::ValidateDefaultValue(PinType, VarName, default_value, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
@@ -300,7 +631,7 @@ FAnimMCPResult UAnimAssetToolset::anim_set_variable_default(const FString& bluep
 		return AnimMCP::Fail(FString::Printf(TEXT("'%s' is not a variable declared on this blueprint."), *name));
 	}
 	FBPVariableDescription& Variable = AnimBP->NewVariables[VarIndex];
-	if (!ValidateDefaultValue(Variable.VarType, VarName, value, Error))
+	if (!AnimMCP::ValidateDefaultValue(Variable.VarType, VarName, value, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
@@ -474,6 +805,10 @@ FAnimMCPResult UAnimAssetToolset::anim_compile_blueprint(const FString& blueprin
 		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 		Item->SetStringField(TEXT("severity"), FTokenizedMessage::GetSeverityText(Message->GetSeverity()).ToString());
 		Item->SetStringField(TEXT("message"), Message->ToText().ToString());
+		if (const TSharedPtr<FJsonObject> Source = DescribeMessageSource(*Message))
+		{
+			Item->SetObjectField(TEXT("source"), Source);
+		}
 		Messages.Add(MakeShared<FJsonValueObject>(Item));
 	}
 
@@ -521,6 +856,60 @@ FAnimMCPResult UAnimAssetToolset::anim_save_asset(const FString& asset_path)
 		return AnimMCP::Fail(FString::Printf(TEXT("Saving '%s' failed. The file may be read-only or checked out by someone else."), *Package->GetName()));
 	}
 	Payload->SetBoolField(TEXT("saved"), true);
+	return AnimMCP::Ok(Payload);
+}
+
+FAnimMCPResult UAnimAssetToolset::anim_set_skeleton_compatible(const FString& skeleton_path, const FString& compatible_skeleton_path, bool compatible)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	USkeleton* Skeleton = AnimMCP::ResolveSkeleton(skeleton_path, Error);
+	if (!Skeleton)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	if (!AnimMCP::IsUnderGameRoot(Skeleton->GetPathName()))
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("Refusing to modify '%s': only assets under /Game may be edited."), *Skeleton->GetPathName()));
+	}
+	USkeleton* Other = AnimMCP::ResolveSkeleton(compatible_skeleton_path, Error);
+	if (!Other)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	if (Other == Skeleton)
+	{
+		return AnimMCP::Fail(TEXT("A skeleton is always compatible with itself; pass a different compatible_skeleton_path."));
+	}
+
+	const TSoftObjectPtr<USkeleton> OtherRef(Other);
+	const bool bListed = Skeleton->GetCompatibleSkeletons().Contains(OtherRef);
+	const bool bChange = compatible != bListed;
+	if (bChange)
+	{
+		const FScopedTransaction Transaction(LOCTEXT("SetSkeletonCompatible", "AnimMCP: Set Compatible Skeleton"));
+		Skeleton->Modify();
+		if (compatible)
+		{
+			Skeleton->AddCompatibleSkeleton(Other);
+		}
+		else
+		{
+			Skeleton->RemoveCompatibleSkeleton(Other);
+		}
+		Skeleton->MarkPackageDirty();
+	}
+
+	TArray<FString> Compatible;
+	for (const TSoftObjectPtr<USkeleton>& Entry : Skeleton->GetCompatibleSkeletons())
+	{
+		Compatible.Add(Entry.ToSoftObjectPath().ToString());
+	}
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
+	Payload->SetBoolField(TEXT("changed"), bChange);
+	Payload->SetArrayField(TEXT("compatible_skeletons"), AnimMCP::ToJsonArray(Compatible));
 	return AnimMCP::Ok(Payload);
 }
 
