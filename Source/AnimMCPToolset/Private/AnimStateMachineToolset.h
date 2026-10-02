@@ -82,18 +82,23 @@ public:
 	 * rule values:
 	 *  'bool_variable' - take the transition while a bool member variable is true (needs variable_name);
 	 *  'not_bool_variable' - take it while that bool variable is false (needs variable_name);
+	 *  'compare' - take it while a float or int member variable compares true against a number, e.g. Speed > 10
+	 *              (needs variable_name, comparison and threshold). The comparison is built inside the rule graph, so no helper bool is needed;
 	 *  'time_remaining' - automatic rule: take it when the source state's animation is about to finish (uses trigger_time);
 	 *  'always' - always true; 'never' - always false.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param transition_guid node_guid of the transition.
-	 * @param rule One of: bool_variable, not_bool_variable, time_remaining, always, never.
-	 * @param variable_name Bool member variable for bool_variable / not_bool_variable. Create it with anim_add_variable if needed. 'none' for other rules.
+	 * @param rule One of: bool_variable, not_bool_variable, compare, time_remaining, always, never.
+	 * @param variable_name Member variable the rule reads: a bool for bool_variable / not_bool_variable, a float, int, int64 or byte for compare. Create it with anim_add_variable if needed. 'none' for other rules.
 	 * @param trigger_time For time_remaining: seconds before the end of the source animation at which to transition. Negative = use the crossfade duration.
 	 * @param crossfade_duration Optional new blend time in seconds. Negative = leave unchanged.
-	 * @return Result: the updated transition node.
+	 * @param comparison For compare: one of >, >=, <, <=, ==, !=. The rule is 'variable <comparison> threshold'.
+	 * @param threshold For compare: the number to compare against. Must be a whole number when the variable is an int, int64 or byte.
+	 * @return Result: the updated transition node plus rule and rule_nodes (node_guids created in the rule graph).
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
-	static FAnimMCPResult anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name = TEXT("none"), float trigger_time = -1.f, float crossfade_duration = -1.f);
+	static FAnimMCPResult anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name = TEXT("none"), float trigger_time = -1.f, float crossfade_duration = -1.f,
+		const FString& comparison = TEXT(">"), float threshold = 0.f);
 
 	/**
 	 * Makes a state play an animation: creates a Sequence Player (for sequences) or Blend Space Player (for blend spaces)

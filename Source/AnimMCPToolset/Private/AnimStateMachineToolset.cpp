@@ -106,6 +106,349 @@ namespace
 		Node->OnRenameNode(Name);
 		return Node;
 	}
+
+	// ---- Transition rules ------------------------------------------------------------------
+
+	enum class ERuleKind : uint8 { Bool, NotBool, Compare, TimeRemaining, Always, Never };
+
+	/** What a member variable can be used for in a rule. */
+	enum class EVariableKind : uint8 { Missing, Bool, Real, Int, Int64, Byte, Other };
+
+	/** A rule as the caller described it, before it is checked against the blueprint. */
+	struct FRuleRequest
+	{
+		FString Rule;
+		FString VariableName = TEXT("none");
+		FString Comparison = TEXT(">");
+		double Threshold = 0.0;
+		float TriggerTime = -1.f;
+	};
+
+	/** A rule that has been validated and can be applied without further checks. */
+	struct FResolvedRule
+	{
+		ERuleKind Kind = ERuleKind::Never;
+		FName Variable;
+		UFunction* Function = nullptr;  // Not_PreBool or the comparison function
+		FString ThresholdText;
+		float TriggerTime = -1.f;
+	};
+
+	/** Variables declared by a caller but not added to the blueprint yet (anim_build_state_machine). */
+	using FPendingVariables = TMap<FName, FEdGraphPinType>;
+
+	EVariableKind KindFromPinType(const FEdGraphPinType& Type)
+	{
+		if (Type.IsContainer())
+		{
+			return EVariableKind::Other;
+		}
+		const FName Category = Type.PinCategory;
+		if (Category == UEdGraphSchema_K2::PC_Boolean)
+		{
+			return EVariableKind::Bool;
+		}
+		if (Category == UEdGraphSchema_K2::PC_Real || Category == UEdGraphSchema_K2::PC_Float || Category == UEdGraphSchema_K2::PC_Double)
+		{
+			return EVariableKind::Real;
+		}
+		if (Category == UEdGraphSchema_K2::PC_Int)
+		{
+			return EVariableKind::Int;
+		}
+		if (Category == UEdGraphSchema_K2::PC_Int64)
+		{
+			return EVariableKind::Int64;
+		}
+		if (Category == UEdGraphSchema_K2::PC_Byte && !Type.PinSubCategoryObject.IsValid())
+		{
+			return EVariableKind::Byte;  // enums are bytes too, but are not compared numerically here
+		}
+		return EVariableKind::Other;
+	}
+
+	/** Looks the variable up in pending declarations, the blueprint's own variables, then inherited properties. */
+	EVariableKind GetVariableKind(UBlueprint* Blueprint, const FName Name, const FPendingVariables* Pending)
+	{
+		if (Pending)
+		{
+			if (const FEdGraphPinType* Type = Pending->Find(Name))
+			{
+				return KindFromPinType(*Type);
+			}
+		}
+		const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, Name);
+		if (VarIndex != INDEX_NONE)
+		{
+			return KindFromPinType(Blueprint->NewVariables[VarIndex].VarType);
+		}
+
+		UClass* SearchClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass.Get() : Blueprint->GeneratedClass.Get();
+		const FProperty* Property = SearchClass ? FindFProperty<FProperty>(SearchClass, Name) : nullptr;
+		if (!Property)
+		{
+			return EVariableKind::Missing;
+		}
+		if (Property->IsA<FBoolProperty>())
+		{
+			return EVariableKind::Bool;
+		}
+		if (Property->IsA<FFloatProperty>() || Property->IsA<FDoubleProperty>())
+		{
+			return EVariableKind::Real;
+		}
+		if (Property->IsA<FIntProperty>())
+		{
+			return EVariableKind::Int;
+		}
+		if (Property->IsA<FInt64Property>())
+		{
+			return EVariableKind::Int64;
+		}
+		if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property))
+		{
+			return ByteProperty->Enum ? EVariableKind::Other : EVariableKind::Byte;
+		}
+		return EVariableKind::Other;
+	}
+
+	/** Maps '>', '>=' ... to the KismetMathLibrary function prefix. */
+	bool ParseComparison(const FString& Text, FString& OutPrefix)
+	{
+		static const TPair<const TCHAR*, const TCHAR*> Operators[] =
+		{
+			{ TEXT(">"), TEXT("Greater") }, { TEXT(">="), TEXT("GreaterEqual") },
+			{ TEXT("<"), TEXT("Less") }, { TEXT("<="), TEXT("LessEqual") },
+			{ TEXT("=="), TEXT("EqualEqual") }, { TEXT("!="), TEXT("NotEqual") },
+		};
+		const FString Trimmed = Text.TrimStartAndEnd();
+		for (const TPair<const TCHAR*, const TCHAR*>& Operator : Operators)
+		{
+			if (Trimmed == Operator.Key)
+			{
+				OutPrefix = Operator.Value;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool ResolveRule(UBlueprint* Blueprint, const FRuleRequest& Request, FResolvedRule& Out, FString& OutError, const FPendingVariables* Pending = nullptr)
+	{
+		const FString Rule = Request.Rule.TrimStartAndEnd().ToLower();
+		if (Rule == TEXT("bool_variable"))             { Out.Kind = ERuleKind::Bool; }
+		else if (Rule == TEXT("not_bool_variable"))    { Out.Kind = ERuleKind::NotBool; }
+		else if (Rule == TEXT("compare"))              { Out.Kind = ERuleKind::Compare; }
+		else if (Rule == TEXT("time_remaining"))       { Out.Kind = ERuleKind::TimeRemaining; }
+		else if (Rule == TEXT("always"))               { Out.Kind = ERuleKind::Always; }
+		else if (Rule == TEXT("never"))                { Out.Kind = ERuleKind::Never; }
+		else
+		{
+			OutError = FString::Printf(TEXT("Unknown rule '%s'. Use bool_variable, not_bool_variable, compare, time_remaining, always or never."), *Request.Rule);
+			return false;
+		}
+		Out.TriggerTime = Request.TriggerTime;
+
+		if (Out.Kind == ERuleKind::Bool || Out.Kind == ERuleKind::NotBool)
+		{
+			Out.Variable = FName(*Request.VariableName.TrimStartAndEnd());
+			if (AnimMCP::IsUnset(Request.VariableName) || GetVariableKind(Blueprint, Out.Variable, Pending) != EVariableKind::Bool)
+			{
+				OutError = FString::Printf(TEXT("Rule '%s' needs variable_name set to a bool member variable (got '%s'). Use anim_list_variables or anim_add_variable."), *Request.Rule, *Request.VariableName);
+				return false;
+			}
+			if (Out.Kind == ERuleKind::NotBool)
+			{
+				Out.Function = UKismetMathLibrary::StaticClass()->FindFunctionByName(GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool));
+			}
+		}
+		else if (Out.Kind == ERuleKind::Compare)
+		{
+			Out.Variable = FName(*Request.VariableName.TrimStartAndEnd());
+			const EVariableKind Kind = AnimMCP::IsUnset(Request.VariableName) ? EVariableKind::Missing : GetVariableKind(Blueprint, Out.Variable, Pending);
+			if (Kind == EVariableKind::Missing)
+			{
+				OutError = FString::Printf(TEXT("Rule 'compare' needs variable_name set to a float or int member variable (got '%s'). Use anim_list_variables or anim_add_variable."), *Request.VariableName);
+				return false;
+			}
+			if (Kind == EVariableKind::Bool || Kind == EVariableKind::Other)
+			{
+				OutError = FString::Printf(TEXT("Variable '%s' is not a float, int, int64 or byte, so it cannot be compared to a number. For a bool use rule bool_variable or not_bool_variable."), *Request.VariableName);
+				return false;
+			}
+
+			FString Prefix;
+			if (!ParseComparison(Request.Comparison, Prefix))
+			{
+				OutError = FString::Printf(TEXT("Unknown comparison '%s'. Use one of: >, >=, <, <=, ==, !=."), *Request.Comparison);
+				return false;
+			}
+
+			const TCHAR* Suffix = TEXT("DoubleDouble");
+			double Min = -DBL_MAX;
+			double Max = DBL_MAX;
+			switch (Kind)
+			{
+			case EVariableKind::Int:   Suffix = TEXT("IntInt");     Min = MIN_int32; Max = MAX_int32; break;
+			case EVariableKind::Int64: Suffix = TEXT("Int64Int64"); Min = (double)MIN_int64; Max = (double)MAX_int64; break;
+			case EVariableKind::Byte:  Suffix = TEXT("ByteByte");   Min = 0; Max = 255; break;
+			default: break;
+			}
+
+			if (Kind == EVariableKind::Real)
+			{
+				Out.ThresholdText = FString::SanitizeFloat(Request.Threshold);
+			}
+			else
+			{
+				if (FMath::RoundToDouble(Request.Threshold) != Request.Threshold || Request.Threshold < Min || Request.Threshold > Max)
+				{
+					OutError = FString::Printf(TEXT("Variable '%s' is an integer type, so threshold must be a whole number in [%.0f, %.0f] (got %g)."), *Request.VariableName, Min, Max, Request.Threshold);
+					return false;
+				}
+				Out.ThresholdText = FString::Printf(TEXT("%lld"), (int64)Request.Threshold);
+			}
+
+			const FName FunctionName(*FString::Printf(TEXT("%s_%s"), *Prefix, Suffix));
+			Out.Function = UKismetMathLibrary::StaticClass()->FindFunctionByName(FunctionName);
+			if (!Out.Function)
+			{
+				OutError = FString::Printf(TEXT("KismetMathLibrary.%s was not found in this engine version."), *FunctionName.ToString());
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Replaces the transition's rule with a resolved rule. The caller owns the transaction.
+	 * OutRuleNodes receives the nodes created in the rule graph.
+	 */
+	bool ApplyRule(UAnimBlueprint* AnimBP, UAnimStateTransitionNode* Transition, const FResolvedRule& Rule, TArray<UEdGraphNode*>& OutRuleNodes, FString& OutError)
+	{
+		if (Transition->IsBoundGraphShared())
+		{
+			OutError = TEXT("This transition uses shared rules. Unshare its rules in the editor before editing it here.");
+			return false;
+		}
+		UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(Transition->BoundGraph);
+		UAnimGraphNode_TransitionResult* ResultNode = RuleGraph ? RuleGraph->GetResultNode() : nullptr;
+		if (!ResultNode)
+		{
+			OutError = TEXT("Transition has no rule graph result node.");
+			return false;
+		}
+		UEdGraphPin* ResultPin = AnimMCP::FindPin(ResultNode, TEXT("bCanEnterTransition"), TEXT("input"), OutError);
+		if (!ResultPin)
+		{
+			return false;
+		}
+
+		Transition->Modify();
+		RuleGraph->Modify();
+		ResultNode->Modify();
+
+		if (Rule.Kind == ERuleKind::TimeRemaining)
+		{
+			Transition->bAutomaticRuleBasedOnSequencePlayerInState = true;
+			Transition->AutomaticRuleTriggerTime = Rule.TriggerTime;
+			return true;
+		}
+		Transition->bAutomaticRuleBasedOnSequencePlayerInState = false;
+
+		// Replace the rule graph: remove everything except the result node.
+		TArray<UEdGraphNode*> ToRemove;
+		for (UEdGraphNode* Node : RuleGraph->Nodes)
+		{
+			if (Node && Node != ResultNode)
+			{
+				ToRemove.Add(Node);
+			}
+		}
+		for (UEdGraphNode* Node : ToRemove)
+		{
+			AnimMCP::RemoveNode(AnimBP, Node);
+		}
+
+		const UEdGraphSchema* Schema = RuleGraph->GetSchema();
+		Schema->BreakPinLinks(*ResultPin, /*bSendsNodeNotifcation*/ true);
+
+		if (Rule.Kind == ERuleKind::Always || Rule.Kind == ERuleKind::Never)
+		{
+			Schema->TrySetDefaultValue(*ResultPin, Rule.Kind == ERuleKind::Always ? TEXT("true") : TEXT("false"));
+			return true;
+		}
+
+		const FVector2D ResultPos(ResultNode->NodePosX, ResultNode->NodePosY);
+		UEdGraphNode* VarNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_VariableGet::StaticClass(), ResultPos + FVector2D(-450.0, 0.0), [&](UEdGraphNode* NewNode)
+		{
+			CastChecked<UK2Node_VariableGet>(NewNode)->VariableReference.SetSelfMember(Rule.Variable);
+		});
+		OutRuleNodes.Add(VarNode);
+		UEdGraphPin* VarPin = AnimMCP::FindPin(VarNode, Rule.Variable.ToString(), TEXT("output"), OutError);
+		if (!VarPin)
+		{
+			OutError = FString::Printf(TEXT("Variable getter for '%s' has no output pin. Compile the blueprint once after adding the variable. %s"), *Rule.Variable.ToString(), *OutError);
+			return false;
+		}
+
+		UEdGraphPin* Source = VarPin;
+		if (Rule.Function)
+		{
+			UEdGraphNode* FunctionNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_CallFunction::StaticClass(), ResultPos + FVector2D(-200.0, 0.0), [&](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_CallFunction>(NewNode)->SetFromFunction(Rule.Function);
+			});
+			OutRuleNodes.Add(FunctionNode);
+			UEdGraphPin* InA = AnimMCP::FindPin(FunctionNode, TEXT("A"), TEXT("input"), OutError);
+			UEdGraphPin* Out = AnimMCP::FindPin(FunctionNode, TEXT("ReturnValue"), TEXT("output"), OutError);
+			if (!InA || !Out || !Schema->TryCreateConnection(VarPin, InA))
+			{
+				OutError = FString::Printf(TEXT("Failed to wire %s in the transition rule."), *Rule.Function->GetName());
+				return false;
+			}
+			if (Rule.Kind == ERuleKind::Compare)
+			{
+				UEdGraphPin* InB = AnimMCP::FindPin(FunctionNode, TEXT("B"), TEXT("input"), OutError);
+				if (!InB)
+				{
+					return false;
+				}
+				Schema->TrySetDefaultValue(*InB, Rule.ThresholdText);
+			}
+			Source = Out;
+		}
+
+		if (!Schema->TryCreateConnection(Source, ResultPin))
+		{
+			OutError = TEXT("Failed to connect the rule to the transition result.");
+			return false;
+		}
+		return true;
+	}
+
+	FString RuleKindToString(ERuleKind Kind)
+	{
+		switch (Kind)
+		{
+		case ERuleKind::Bool:          return TEXT("bool_variable");
+		case ERuleKind::NotBool:       return TEXT("not_bool_variable");
+		case ERuleKind::Compare:       return TEXT("compare");
+		case ERuleKind::TimeRemaining: return TEXT("time_remaining");
+		case ERuleKind::Always:        return TEXT("always");
+		default:                       return TEXT("never");
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> NodeGuidArray(const TArray<UEdGraphNode*>& Nodes)
+	{
+		TArray<FString> Guids;
+		for (const UEdGraphNode* Node : Nodes)
+		{
+			Guids.Add(AnimMCP::GuidToString(Node->NodeGuid));
+		}
+		return AnimMCP::ToJsonArray(Guids);
+	}
 }
 
 FAnimMCPResult UAnimStateMachineToolset::anim_add_state_machine(const FString& blueprint_path, const FString& graph, const FString& name, float x, float y)
@@ -319,7 +662,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_transition(const FString& b
 	return AnimMCP::Ok(Payload);
 }
 
-FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name, float trigger_time, float crossfade_duration)
+FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name, float trigger_time, float crossfade_duration,
+	const FString& comparison, float threshold)
 {
 	ANIMMCP_REQUIRE_GAME_THREAD();
 
@@ -339,118 +683,44 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 		return AnimMCP::Fail(TEXT("This transition uses shared rules. Unshare its rules in the editor before editing it here."));
 	}
 
-	const FString Rule = rule.TrimStartAndEnd().ToLower();
-	const bool bVariableRule = Rule == TEXT("bool_variable") || Rule == TEXT("not_bool_variable");
-	const bool bConstantRule = Rule == TEXT("always") || Rule == TEXT("never");
-	const bool bTimeRule = Rule == TEXT("time_remaining");
-	if (!bVariableRule && !bConstantRule && !bTimeRule)
-	{
-		return AnimMCP::Fail(FString::Printf(TEXT("Unknown rule '%s'. Use bool_variable, not_bool_variable, time_remaining, always or never."), *rule));
-	}
-
-	UAnimationTransitionGraph* RuleGraph = Cast<UAnimationTransitionGraph>(Transition->BoundGraph);
-	UAnimGraphNode_TransitionResult* ResultNode = RuleGraph ? RuleGraph->GetResultNode() : nullptr;
-	if (!ResultNode)
-	{
-		return AnimMCP::Fail(TEXT("Transition has no rule graph result node."));
-	}
-	UEdGraphPin* ResultPin = AnimMCP::FindPin(ResultNode, TEXT("bCanEnterTransition"), TEXT("input"), Error);
-	if (!ResultPin)
+	FRuleRequest Request;
+	Request.Rule = rule;
+	Request.VariableName = variable_name;
+	Request.Comparison = comparison;
+	Request.Threshold = threshold;
+	Request.TriggerTime = trigger_time;
+	FResolvedRule Resolved;
+	if (!ResolveRule(AnimBP, Request, Resolved, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
 
-	if (bVariableRule)
-	{
-		UClass* SearchClass = AnimBP->SkeletonGeneratedClass ? AnimBP->SkeletonGeneratedClass.Get() : AnimBP->GeneratedClass.Get();
-		const FBoolProperty* BoolProperty = SearchClass ? FindFProperty<FBoolProperty>(SearchClass, FName(*variable_name)) : nullptr;
-		const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(AnimBP, FName(*variable_name));
-		const bool bDeclaredBool = VarIndex != INDEX_NONE && AnimBP->NewVariables[VarIndex].VarType.PinCategory == UEdGraphSchema_K2::PC_Boolean;
-		if (AnimMCP::IsUnset(variable_name) || (!BoolProperty && !bDeclaredBool))
-		{
-			return AnimMCP::Fail(FString::Printf(TEXT("Rule '%s' needs variable_name set to a bool member variable (got '%s'). Use anim_list_variables or anim_add_variable."), *rule, *variable_name));
-		}
-	}
 	const FScopedTransaction Transaction(LOCTEXT("SetTransitionRule", "AnimMCP: Set Transition Rule"));
 	AnimBP->Modify();
-	Transition->Modify();
-	RuleGraph->Modify();
-	ResultNode->Modify();
-
 	if (crossfade_duration >= 0.f)
 	{
+		Transition->Modify();
 		Transition->CrossfadeDuration = crossfade_duration;
 	}
 
-	if (bTimeRule)
+	TArray<UEdGraphNode*> RuleNodes;
+	if (!ApplyRule(AnimBP, Transition, Resolved, RuleNodes, Error))
 	{
-		Transition->bAutomaticRuleBasedOnSequencePlayerInState = true;
-		Transition->AutomaticRuleTriggerTime = trigger_time;
+		return AnimMCP::Fail(Error);
+	}
+	if (Resolved.Kind == ERuleKind::TimeRemaining)
+	{
 		FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
-		return AnimMCP::Ok(AnimMCP::NodeToJson(Transition, /*bIncludePins*/ false));
-	}
-
-	Transition->bAutomaticRuleBasedOnSequencePlayerInState = false;
-
-	// Replace the rule graph: remove everything except the result node.
-	TArray<UEdGraphNode*> ToRemove;
-	for (UEdGraphNode* Node : RuleGraph->Nodes)
-	{
-		if (Node && Node != ResultNode)
-		{
-			ToRemove.Add(Node);
-		}
-	}
-	for (UEdGraphNode* Node : ToRemove)
-	{
-		AnimMCP::RemoveNode(AnimBP, Node);
-	}
-
-	const UEdGraphSchema* Schema = RuleGraph->GetSchema();
-	Schema->BreakPinLinks(*ResultPin, /*bSendsNodeNotifcation*/ true);
-
-	if (bConstantRule)
-	{
-		Schema->TrySetDefaultValue(*ResultPin, Rule == TEXT("always") ? TEXT("true") : TEXT("false"));
 	}
 	else
 	{
-		const FVector2D ResultPos(ResultNode->NodePosX, ResultNode->NodePosY);
-		UEdGraphNode* VarNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_VariableGet::StaticClass(), ResultPos + FVector2D(-450.0, 0.0), [&](UEdGraphNode* NewNode)
-		{
-			CastChecked<UK2Node_VariableGet>(NewNode)->VariableReference.SetSelfMember(FName(*variable_name));
-		});
-		UEdGraphPin* VarPin = AnimMCP::FindPin(VarNode, variable_name, TEXT("output"), Error);
-		if (!VarPin)
-		{
-			return AnimMCP::Fail(FString::Printf(TEXT("Variable getter for '%s' has no output pin. Compile the blueprint once after adding the variable. %s"), *variable_name, *Error));
-		}
-
-		UEdGraphPin* Source = VarPin;
-		if (Rule == TEXT("not_bool_variable"))
-		{
-			UFunction* NotFunction = UKismetMathLibrary::StaticClass()->FindFunctionByName(GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool));
-			UEdGraphNode* NotNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_CallFunction::StaticClass(), ResultPos + FVector2D(-200.0, 0.0), [&](UEdGraphNode* NewNode)
-			{
-				CastChecked<UK2Node_CallFunction>(NewNode)->SetFromFunction(NotFunction);
-			});
-			UEdGraphPin* NotIn = AnimMCP::FindPin(NotNode, TEXT("A"), TEXT("input"), Error);
-			UEdGraphPin* NotOut = AnimMCP::FindPin(NotNode, TEXT("ReturnValue"), TEXT("output"), Error);
-			if (!NotIn || !NotOut || !Schema->TryCreateConnection(VarPin, NotIn))
-			{
-				return AnimMCP::Fail(TEXT("Failed to wire the NOT node in the transition rule."));
-			}
-			Source = NotOut;
-		}
-
-		if (!Schema->TryCreateConnection(Source, ResultPin))
-		{
-			return AnimMCP::Fail(TEXT("Failed to connect the rule to the transition result."));
-		}
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
-	return AnimMCP::Ok(AnimMCP::NodeToJson(Transition, /*bIncludePins*/ false));
+	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(Transition, /*bIncludePins*/ false);
+	Payload->SetStringField(TEXT("rule"), RuleKindToString(Resolved.Kind));
+	Payload->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+	return AnimMCP::Ok(Payload);
 }
 
 FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path)
