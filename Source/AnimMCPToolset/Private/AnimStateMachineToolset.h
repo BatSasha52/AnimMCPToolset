@@ -101,15 +101,26 @@ public:
 		const FString& comparison = TEXT(">"), float threshold = 0.f);
 
 	/**
-	 * Makes a state play an animation: creates a Sequence Player (for sequences) or Blend Space Player (for blend spaces)
-	 * inside the state and wires it to the state's output pose, replacing any asset player previously wired there.
+	 * Makes a state play an animation: creates the node inside the state and wires it to the state's output pose,
+	 * replacing the asset player or slot previously wired there. With only asset_path this creates a looping Sequence Player
+	 * (for sequences) or Blend Space Player (for blend spaces) at play rate 1, exactly like the editor default.
+	 * node_type values:
+	 *  'auto' - Sequence Player or Blend Space Player depending on the asset;
+	 *  'sequence_player', 'blendspace_player' - the same, but checks the asset type;
+	 *  'sequence_evaluator', 'blendspace_evaluator' - plays the time you drive into its Explicit Time / Normalized Time pin (play_rate must stay 1);
+	 *  'slot' - a montage Slot node named slot_name wired to the output; asset_path (optional) becomes the slot's source pose.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param state_guid node_guid of the state.
-	 * @param asset_path Path of an AnimSequence or BlendSpace compatible with the blueprint's skeleton.
-	 * @return Result: the asset player node created inside the state.
+	 * @param asset_path Path of an AnimSequence or BlendSpace compatible with the blueprint's skeleton. May be 'none' only for node_type 'slot'.
+	 * @param node_type One of: auto, sequence_player, sequence_evaluator, blendspace_player, blendspace_evaluator, slot.
+	 * @param loop Whether the animation loops. False is typical for one-shot states such as Land or JumpStart.
+	 * @param play_rate Play rate multiplier for players (negative plays in reverse). Must be 1 for evaluators.
+	 * @param slot_name For node_type 'slot': the montage slot, e.g. 'DefaultSlot' or 'UpperBody'.
+	 * @return Result: the node wired to the state output, plus player_node_guid and (for slots) slot_node_guid.
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
-	static FAnimMCPResult anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path);
+	static FAnimMCPResult anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path,
+		const FString& node_type = TEXT("auto"), bool loop = true, float play_rate = 1.f, const FString& slot_name = TEXT("DefaultSlot"));
 
 	/**
 	 * Adds a conduit (a branching point with its own rule and no pose) to a state machine.
@@ -137,7 +148,8 @@ public:
 	 *                                      // created if missing, reused if they already exist with the same type
 	 *   "entry_state": "Idle",             // default: the first state
 	 *   "states": [ {"name": "Idle", "animation": "/Game/Anims/Idle", "loop": true, "play_rate": 1.0, "x": 300, "y": 0} ],
-	 *                                      // animation is optional; positions default to a grid
+	 *                                      // animation is optional; node_type and slot_name work as in anim_set_state_animation;
+	 *                                      // positions default to a grid
 	 *   "conduits": [ {"name": "Branch"} ],
 	 *   "transitions": [ {"from": "Idle", "to": "Run", "rule": "compare", "variable": "Speed", "comparison": ">", "threshold": 10,
 	 *                     "crossfade_duration": 0.2} ]

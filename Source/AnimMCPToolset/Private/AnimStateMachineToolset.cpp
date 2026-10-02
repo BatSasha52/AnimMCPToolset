@@ -10,9 +10,12 @@
 #include "Animation/BlendSpace.h"
 #include "Animation/Skeleton.h"
 #include "AnimGraphNode_AssetPlayerBase.h"
+#include "AnimGraphNode_BlendSpaceEvaluator.h"
 #include "AnimGraphNode_BlendSpacePlayer.h"
 #include "AnimGraphNode_Root.h"
+#include "AnimGraphNode_SequenceEvaluator.h"
 #include "AnimGraphNode_SequencePlayer.h"
+#include "AnimGraphNode_Slot.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateResult.h"
 #include "AnimGraphNode_TransitionResult.h"
@@ -455,47 +458,110 @@ namespace
 		}
 		return AnimMCP::ToJsonArray(Guids);
 	}
-
 	// ---- State animations ------------------------------------------------------------------
 
-	struct FStateAnimationOptions
+	/** What a state should play, as requested; ResolveStateAnimation fills in the resolved fields. */
+	struct FStateAnimation
 	{
+		FString AssetPath = TEXT("none");
+		FString NodeType = TEXT("auto");
 		bool bLoop = true;
 		float PlayRate = 1.f;
+		FString SlotName = TEXT("DefaultSlot");
+
+		// Resolved
+		UAnimationAsset* Asset = nullptr;
+		UClass* PlayerClass = nullptr;  // null for a slot with no source animation
+		bool bSlot = false;
 	};
 
-	/** Loads the asset, checks the skeleton and picks the asset player class for it. */
-	bool ResolveStateAnimation(UAnimBlueprint* AnimBP, const FString& AssetPath, UAnimationAsset*& OutAsset, UClass*& OutPlayerClass, FString& OutError)
+	/** Validates the request: loads the asset, checks the skeleton and the node type, and picks the node classes. */
+	bool ResolveStateAnimation(UAnimBlueprint* AnimBP, FStateAnimation& Anim, FString& OutError)
 	{
-		OutAsset = AnimMCP::LoadAsset<UAnimationAsset>(AssetPath, /*bForWrite*/ false, OutError);
-		if (!OutAsset)
+		const FString Type = Anim.NodeType.TrimStartAndEnd().ToLower();
+		const bool bAuto = Type.IsEmpty() || Type == TEXT("auto");
+		const bool bSequencePlayer = Type == TEXT("sequence_player");
+		const bool bSequenceEvaluator = Type == TEXT("sequence_evaluator");
+		const bool bBlendSpacePlayer = Type == TEXT("blendspace_player");
+		const bool bBlendSpaceEvaluator = Type == TEXT("blendspace_evaluator");
+		Anim.bSlot = Type == TEXT("slot");
+		if (!bAuto && !bSequencePlayer && !bSequenceEvaluator && !bBlendSpacePlayer && !bBlendSpaceEvaluator && !Anim.bSlot)
 		{
+			OutError = FString::Printf(TEXT("Unknown node_type '%s'. Use auto, sequence_player, sequence_evaluator, blendspace_player, blendspace_evaluator or slot."), *Anim.NodeType);
+			return false;
+		}
+		if ((bSequenceEvaluator || bBlendSpaceEvaluator) && Anim.PlayRate != 1.f)
+		{
+			OutError = TEXT("play_rate does not apply to evaluators: an evaluator plays the time you drive into its time pin. Leave play_rate at 1.");
+			return false;
+		}
+		if (Anim.bSlot && Anim.SlotName.TrimStartAndEnd().IsEmpty())
+		{
+			OutError = TEXT("node_type 'slot' needs a slot_name, e.g. 'DefaultSlot'.");
 			return false;
 		}
 
-		if (OutAsset->IsA<UAnimMontage>())
+		if (AnimMCP::IsUnset(Anim.AssetPath))
 		{
-			OutError = FString::Printf(TEXT("'%s' is a montage. Montages cannot be played by a state. Use an AnimSequence or BlendSpace, or play the montage from a Slot node."), *AssetPath);
+			if (Anim.bSlot)
+			{
+				if (!Anim.bLoop || Anim.PlayRate != 1.f)
+				{
+					OutError = TEXT("loop and play_rate apply to the slot's source animation; pass asset_path as well.");
+					return false;
+				}
+				return true;  // A slot with nothing plugged into its source.
+			}
+			OutError = TEXT("asset_path is required (it may only be 'none' for node_type 'slot').");
 			return false;
 		}
-		else if (OutAsset->IsA<UAnimSequenceBase>())
+
+		Anim.Asset = AnimMCP::LoadAsset<UAnimationAsset>(Anim.AssetPath, /*bForWrite*/ false, OutError);
+		if (!Anim.Asset)
 		{
-			OutPlayerClass = UAnimGraphNode_SequencePlayer::StaticClass();
+			return false;
 		}
-		else if (OutAsset->IsA<UBlendSpace>())
+		if (Anim.Asset->IsA<UAnimMontage>())
 		{
-			OutPlayerClass = UAnimGraphNode_BlendSpacePlayer::StaticClass();
+			OutError = FString::Printf(TEXT("'%s' is a montage. Montages are not played by a state node: use node_type 'slot' with the montage's slot name and play the montage at runtime (Play Montage / Montage_Play)."), *Anim.AssetPath);
+			return false;
+		}
+
+		const bool bIsSequence = Anim.Asset->IsA<UAnimSequenceBase>();
+		const bool bIsBlendSpace = Anim.Asset->IsA<UBlendSpace>();
+		if (!bIsSequence && !bIsBlendSpace)
+		{
+			OutError = FString::Printf(TEXT("'%s' is a %s. States can play AnimSequences or BlendSpaces."), *Anim.AssetPath, *Anim.Asset->GetClass()->GetName());
+			return false;
+		}
+		if ((bSequencePlayer || bSequenceEvaluator) && !bIsSequence)
+		{
+			OutError = FString::Printf(TEXT("node_type '%s' needs an AnimSequence, but '%s' is a %s."), *Type, *Anim.AssetPath, *Anim.Asset->GetClass()->GetName());
+			return false;
+		}
+		if ((bBlendSpacePlayer || bBlendSpaceEvaluator) && !bIsBlendSpace)
+		{
+			OutError = FString::Printf(TEXT("node_type '%s' needs a BlendSpace, but '%s' is a %s."), *Type, *Anim.AssetPath, *Anim.Asset->GetClass()->GetName());
+			return false;
+		}
+
+		if (bSequenceEvaluator)
+		{
+			Anim.PlayerClass = UAnimGraphNode_SequenceEvaluator::StaticClass();
+		}
+		else if (bBlendSpaceEvaluator)
+		{
+			Anim.PlayerClass = UAnimGraphNode_BlendSpaceEvaluator::StaticClass();
 		}
 		else
 		{
-			OutError = FString::Printf(TEXT("'%s' is a %s. States can play AnimSequences or BlendSpaces."), *AssetPath, *OutAsset->GetClass()->GetName());
-			return false;
+			Anim.PlayerClass = bIsSequence ? UAnimGraphNode_SequencePlayer::StaticClass() : UAnimGraphNode_BlendSpacePlayer::StaticClass();
 		}
 
-		if (AnimBP->TargetSkeleton && OutAsset->GetSkeleton() && !AnimBP->TargetSkeleton->IsCompatibleForEditor(OutAsset->GetSkeleton()))
+		if (AnimBP->TargetSkeleton && Anim.Asset->GetSkeleton() && !AnimBP->TargetSkeleton->IsCompatibleForEditor(Anim.Asset->GetSkeleton()))
 		{
 			OutError = FString::Printf(TEXT("'%s' uses skeleton %s, which is not compatible with the blueprint's skeleton %s."),
-				*AssetPath, *OutAsset->GetSkeleton()->GetPathName(), *AnimBP->TargetSkeleton->GetPathName());
+				*Anim.AssetPath, *Anim.Asset->GetSkeleton()->GetPathName(), *AnimBP->TargetSkeleton->GetPathName());
 			return false;
 		}
 		return true;
@@ -524,13 +590,21 @@ namespace
 		return true;
 	}
 
-	/**
-	 * Replaces the asset player wired to the state's output pose with a new one. The caller owns the transaction.
-	 * Other nodes inside the state are left alone.
-	 */
-	bool ApplyStateAnimation(UAnimBlueprint* AnimBP, UAnimStateNode* State, UAnimationAsset* Asset, UClass* PlayerClass, const FStateAnimationOptions& Options,
-		UAnimGraphNode_Base*& OutPlayer, FString& OutError)
+	/** True for nodes this plugin places in front of a state's output: asset players and slots. */
+	bool IsReplaceablePoseNode(const UEdGraphNode* Node)
 	{
+		return Node && (Node->IsA<UAnimGraphNode_AssetPlayerBase>() || Node->IsA<UAnimGraphNode_Slot>());
+	}
+
+	/**
+	 * Replaces the asset player (or slot) wired to the state's output pose with new nodes. The caller owns the transaction.
+	 * Other nodes inside the state are left alone. OutPoseNode is the node wired to the output; OutPlayer the asset player (may be null for an empty slot).
+	 */
+	bool ApplyStateAnimation(UAnimBlueprint* AnimBP, UAnimStateNode* State, const FStateAnimation& Anim,
+		UAnimGraphNode_Base*& OutPoseNode, UAnimGraphNode_Base*& OutPlayer, FString& OutError)
+	{
+		OutPoseNode = nullptr;
+		OutPlayer = nullptr;
 		UEdGraph* StateGraph = State->BoundGraph;
 		UEdGraphPin* PoseSink = State->GetPoseSinkPinInsideState();
 		UAnimGraphNode_StateResult* ResultNode = State->GetResultNodeInsideState();
@@ -541,43 +615,92 @@ namespace
 		}
 		StateGraph->Modify();
 		ResultNode->Modify();
+		const UEdGraphSchema* Schema = StateGraph->GetSchema();
 
-		// Drop asset players that only fed the output pose; other upstream nodes are left untouched.
+		// Drop asset players / slots that only fed the output pose (and a player that only fed such a slot).
 		TArray<UEdGraphNode*> ToRemove;
 		for (UEdGraphPin* Linked : PoseSink->LinkedTo)
 		{
-			UAnimGraphNode_AssetPlayerBase* OldPlayer = Cast<UAnimGraphNode_AssetPlayerBase>(Linked->GetOwningNode());
-			if (OldPlayer && Linked->LinkedTo.Num() == 1)
+			UEdGraphNode* OldNode = Linked->GetOwningNode();
+			if (!IsReplaceablePoseNode(OldNode) || Linked->LinkedTo.Num() != 1)
 			{
-				ToRemove.Add(OldPlayer);
+				continue;
+			}
+			ToRemove.Add(OldNode);
+			if (OldNode->IsA<UAnimGraphNode_Slot>())
+			{
+				if (UEdGraphPin* SourcePin = AnimMCP::FindFirstPin(OldNode, EGPD_Input))
+				{
+					for (UEdGraphPin* SourceLink : SourcePin->LinkedTo)
+					{
+						UEdGraphNode* SourceNode = SourceLink->GetOwningNode();
+						if (SourceNode->IsA<UAnimGraphNode_AssetPlayerBase>() && SourceLink->LinkedTo.Num() == 1)
+						{
+							ToRemove.Add(SourceNode);
+						}
+					}
+				}
 			}
 		}
-		StateGraph->GetSchema()->BreakPinLinks(*PoseSink, /*bSendsNodeNotifcation*/ true);
+		Schema->BreakPinLinks(*PoseSink, /*bSendsNodeNotifcation*/ true);
 		for (UEdGraphNode* Node : ToRemove)
 		{
 			AnimMCP::RemoveNode(AnimBP, Node);
 		}
 
-		const FVector2D Position(ResultNode->NodePosX - 350.0, ResultNode->NodePosY);
-		UAnimGraphNode_AssetPlayerBase* Player = CastChecked<UAnimGraphNode_AssetPlayerBase>(AnimMCP::SpawnNode(StateGraph, PlayerClass, Position));
-		Player->SetAnimationAsset(Asset);
-		OutPlayer = Player;
+		const FVector2D OutputPos(ResultNode->NodePosX - 350.0, ResultNode->NodePosY);
+		if (Anim.PlayerClass)
+		{
+			const FVector2D PlayerPos = Anim.bSlot ? OutputPos - FVector2D(300.0, 0.0) : OutputPos;
+			UAnimGraphNode_AssetPlayerBase* Player = CastChecked<UAnimGraphNode_AssetPlayerBase>(AnimMCP::SpawnNode(StateGraph, Anim.PlayerClass, PlayerPos));
+			Player->SetAnimationAsset(Anim.Asset);
+			OutPlayer = Player;
 
-		// Only touch settings that differ from the node defaults, so a plain call creates exactly what the editor would.
-		const FName LoopProperty = PlayerClass->IsChildOf(UAnimGraphNode_BlendSpacePlayer::StaticClass()) ? FName(TEXT("bLoop")) : FName(TEXT("bLoopAnimation"));
-		if (!Options.bLoop && !SetNodeStructValue(Player, LoopProperty, TEXT("False"), OutError))
-		{
-			return false;
-		}
-		if (Options.PlayRate != 1.f && !SetNodeStructValue(Player, TEXT("PlayRate"), FString::SanitizeFloat(Options.PlayRate), OutError))
-		{
-			return false;
+			// Only touch settings that differ from the node defaults, so a plain call creates exactly what the editor would.
+			FName LoopProperty = TEXT("bLoopAnimation");
+			if (Anim.PlayerClass->IsChildOf(UAnimGraphNode_BlendSpaceBase::StaticClass()))
+			{
+				LoopProperty = TEXT("bLoop");
+			}
+			else if (Anim.PlayerClass->IsChildOf(UAnimGraphNode_SequenceEvaluator::StaticClass()))
+			{
+				LoopProperty = TEXT("bShouldLoop");
+			}
+			if (!Anim.bLoop && !SetNodeStructValue(Player, LoopProperty, TEXT("False"), OutError))
+			{
+				return false;
+			}
+			if (Anim.PlayRate != 1.f && !SetNodeStructValue(Player, TEXT("PlayRate"), FString::SanitizeFloat(Anim.PlayRate), OutError))
+			{
+				return false;
+			}
+			OutPoseNode = Player;
 		}
 
-		UEdGraphPin* PlayerOut = AnimMCP::FindFirstPin(Player, EGPD_Output);
-		if (!PlayerOut || !StateGraph->GetSchema()->TryCreateConnection(PlayerOut, PoseSink))
+		if (Anim.bSlot)
 		{
-			OutError = TEXT("Failed to connect the asset player to the state's output pose.");
+			UAnimGraphNode_Slot* Slot = CastChecked<UAnimGraphNode_Slot>(AnimMCP::SpawnNode(StateGraph, UAnimGraphNode_Slot::StaticClass(), OutputPos));
+			if (!SetNodeStructValue(Slot, TEXT("SlotName"), Anim.SlotName.TrimStartAndEnd(), OutError))
+			{
+				return false;
+			}
+			if (OutPlayer)
+			{
+				UEdGraphPin* PlayerOut = AnimMCP::FindFirstPin(OutPlayer, EGPD_Output);
+				UEdGraphPin* SlotSource = AnimMCP::FindFirstPin(Slot, EGPD_Input);
+				if (!PlayerOut || !SlotSource || !Schema->TryCreateConnection(PlayerOut, SlotSource))
+				{
+					OutError = TEXT("Failed to connect the source animation to the slot.");
+					return false;
+				}
+			}
+			OutPoseNode = Slot;
+		}
+
+		UEdGraphPin* PoseOut = OutPoseNode ? AnimMCP::FindFirstPin(OutPoseNode, EGPD_Output) : nullptr;
+		if (!PoseOut || !Schema->TryCreateConnection(PoseOut, PoseSink))
+		{
+			OutError = TEXT("Failed to connect the new node to the state's output pose.");
 			return false;
 		}
 		return true;
@@ -856,7 +979,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	return AnimMCP::Ok(Payload);
 }
 
-FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path)
+FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path,
+	const FString& node_type, bool loop, float play_rate, const FString& slot_name)
 {
 	ANIMMCP_REQUIRE_GAME_THREAD();
 
@@ -871,9 +995,13 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	{
 		return AnimMCP::Fail(Error);
 	}
-	UAnimationAsset* Asset = nullptr;
-	UClass* PlayerClass = nullptr;
-	if (!ResolveStateAnimation(AnimBP, asset_path, Asset, PlayerClass, Error))
+	FStateAnimation Anim;
+	Anim.AssetPath = asset_path;
+	Anim.NodeType = node_type;
+	Anim.bLoop = loop;
+	Anim.PlayRate = play_rate;
+	Anim.SlotName = slot_name;
+	if (!ResolveStateAnimation(AnimBP, Anim, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
@@ -884,14 +1012,24 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 
 	const FScopedTransaction Transaction(LOCTEXT("SetStateAnimation", "AnimMCP: Set State Animation"));
 	AnimBP->Modify();
+	UAnimGraphNode_Base* PoseNode = nullptr;
 	UAnimGraphNode_Base* Player = nullptr;
-	if (!ApplyStateAnimation(AnimBP, State, Asset, PlayerClass, FStateAnimationOptions(), Player, Error))
+	if (!ApplyStateAnimation(AnimBP, State, Anim, PoseNode, Player, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
-	return AnimMCP::Ok(AnimMCP::NodeToJson(Player, /*bIncludePins*/ false));
+	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(PoseNode, /*bIncludePins*/ false);
+	if (Player)
+	{
+		Payload->SetStringField(TEXT("player_node_guid"), AnimMCP::GuidToString(Player->NodeGuid));
+	}
+	if (Anim.bSlot)
+	{
+		Payload->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
+	}
+	return AnimMCP::Ok(Payload);
 }
 
 FAnimMCPResult UAnimStateMachineToolset::anim_add_conduit(const FString& blueprint_path, const FString& state_machine_guid, const FString& name, float x, float y)
@@ -942,9 +1080,8 @@ namespace
 	{
 		FString Name;
 		bool bConduit = false;
-		UAnimationAsset* Asset = nullptr;
-		UClass* PlayerClass = nullptr;
-		FStateAnimationOptions Options;
+		bool bHasAnimation = false;
+		FStateAnimation Animation;
 		TOptional<FVector2D> Position;
 	};
 
@@ -1227,7 +1364,7 @@ namespace
 				}
 				else
 				{
-					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("animation"), TEXT("loop"), TEXT("play_rate"), TEXT("x"), TEXT("y") });
+					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("animation"), TEXT("node_type"), TEXT("loop"), TEXT("play_rate"), TEXT("slot_name"), TEXT("x"), TEXT("y") });
 				}
 
 				FSpecNode Node;
@@ -1258,21 +1395,28 @@ namespace
 
 				if (!bConduit)
 				{
-					FString AnimationPath;
-					if (Read.String(Item, Where, TEXT("animation"), AnimationPath) && !AnimMCP::IsUnset(AnimationPath)
-						&& !ResolveStateAnimation(AnimBP, AnimationPath, Node.Asset, Node.PlayerClass, Error))
-					{
-						Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
-					}
-					Read.Bool(Item, Where, TEXT("loop"), Node.Options.bLoop);
+					FStateAnimation& Anim = Node.Animation;
+					Read.String(Item, Where, TEXT("animation"), Anim.AssetPath);
+					Read.String(Item, Where, TEXT("node_type"), Anim.NodeType);
+					Read.String(Item, Where, TEXT("slot_name"), Anim.SlotName);
+					Read.Bool(Item, Where, TEXT("loop"), Anim.bLoop);
 					double PlayRate = 1.0;
 					if (Read.Number(Item, Where, TEXT("play_rate"), PlayRate))
 					{
-						Node.Options.PlayRate = (float)PlayRate;
+						Anim.PlayRate = (float)PlayRate;
 					}
-					if ((!Node.Options.bLoop || Node.Options.PlayRate != 1.f) && AnimMCP::IsUnset(AnimationPath))
+					const bool bWantsSlot = Anim.NodeType.TrimStartAndEnd().Equals(TEXT("slot"), ESearchCase::IgnoreCase);
+					if (!AnimMCP::IsUnset(Anim.AssetPath) || bWantsSlot)
 					{
-						Problems.Add(FString::Printf(TEXT("%s: 'loop' and 'play_rate' need an 'animation'."), *Where));
+						Node.bHasAnimation = true;
+						if (!ResolveStateAnimation(AnimBP, Anim, Error))
+						{
+							Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+						}
+					}
+					else if (!Anim.bLoop || Anim.PlayRate != 1.f || (!AnimMCP::IsUnset(Anim.NodeType) && !Anim.NodeType.Equals(TEXT("auto"), ESearchCase::IgnoreCase)))
+					{
+						Problems.Add(FString::Printf(TEXT("%s: 'node_type', 'loop' and 'play_rate' need an 'animation'."), *Where));
 					}
 				}
 				Out.Nodes.Add(MoveTemp(Node));
@@ -1433,16 +1577,24 @@ namespace
 			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 			Item->SetStringField(TEXT("name"), StateNode->GetStateName());
 			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(StateNode->NodeGuid));
-			if (Node.Asset)
+			if (Node.bHasAnimation)
 			{
+				UAnimGraphNode_Base* PoseNode = nullptr;
 				UAnimGraphNode_Base* Player = nullptr;
-				if (!ApplyStateAnimation(AnimBP, CastChecked<UAnimStateNode>(StateNode), Node.Asset, Node.PlayerClass, Node.Options, Player, OutError))
+				if (!ApplyStateAnimation(AnimBP, CastChecked<UAnimStateNode>(StateNode), Node.Animation, PoseNode, Player, OutError))
 				{
 					OutError = FString::Printf(TEXT("State '%s': %s"), *Node.Name, *OutError);
 					return false;
 				}
-				Item->SetStringField(TEXT("player_node_guid"), AnimMCP::GuidToString(Player->NodeGuid));
-				Item->SetStringField(TEXT("animation"), Node.Asset->GetPathName());
+				if (Player)
+				{
+					Item->SetStringField(TEXT("player_node_guid"), AnimMCP::GuidToString(Player->NodeGuid));
+					Item->SetStringField(TEXT("animation"), Node.Animation.Asset->GetPathName());
+				}
+				if (Node.Animation.bSlot)
+				{
+					Item->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
+				}
 			}
 			(Node.bConduit ? ConduitItems : StateItems).Add(Item);
 		}

@@ -168,5 +168,33 @@ r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP2, graph="AnimG
 r and log("%s nothing created on bad spec: state machines=%d" % ("OK  " if len([x for x in r["nodes"] if x["class"] == "AnimGraphNode_StateMachine"]) == 1 else "FAIL", len([x for x in r["nodes"] if x["class"] == "AnimGraphNode_StateMachine"])))
 expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec="{not json")
 
+# --- v0.2 step 3: anim_set_state_animation node types, loop, play rate
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP2, graph="AnimGraph")
+sm2 = [x for x in r["nodes"] if x["class"] == "AnimGraphNode_StateMachine"][0]["node_guid"]
+st = ok("AnimStateMachineToolset", "anim_add_state", blueprint_path=BP2, state_machine_guid=sm2, name="Options", x=300, y=600)
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK)
+r and log("%s default node: %s" % ("OK  " if r["class"] == "AnimGraphNode_SequencePlayer" else "FAIL", r["class"]))
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK, loop=False, play_rate=0.5)
+r and log("%s non-default loop/play rate accepted: %s" % ("OK  " if r["class"] == "AnimGraphNode_SequencePlayer" else "FAIL", r["class"]))  # values themselves are not readable through the tools
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK, node_type="sequence_evaluator", loop=False)
+r and log("%s evaluator: %s" % ("OK  " if r["class"] == "AnimGraphNode_SequenceEvaluator" else "FAIL", r["class"]))
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path="/Game/AMCPTest/BS_Test", node_type="blendspace_player", play_rate=2)
+r and log("%s blend space player: %s" % ("OK  " if r["class"] == "AnimGraphNode_BlendSpacePlayer" else "FAIL", r["class"]))
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path="/Game/AMCPTest/BS_Test", node_type="blendspace_evaluator")
+r and log("%s blend space evaluator: %s" % ("OK  " if r["class"] == "AnimGraphNode_BlendSpaceEvaluator" else "FAIL", r["class"]))
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=IDLE, node_type="slot", slot_name="DefaultSlot")
+r and log("%s slot: %s player=%s" % ("OK  " if r["class"] == "AnimGraphNode_Slot" and r.get("player_node_guid") else "FAIL", r["class"], r.get("player_node_guid")))
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP2, graph="Options")
+r and log("%s state graph after replacements: %s" % ("OK  " if sorted(x["class"] for x in r["nodes"]) == ["AnimGraphNode_SequencePlayer", "AnimGraphNode_Slot", "AnimGraphNode_StateResult"] else "FAIL", sorted(x["class"] for x in r["nodes"])))
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path="none", node_type="slot")
+expect_fail("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK, node_type="sequence_evaluator", play_rate=2)
+expect_fail("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK, node_type="blendspace_player")
+expect_fail("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path=WALK, node_type="wobble")
+expect_fail("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP2, state_guid=st["node_guid"], asset_path="none")
+spec3 = {"name": "Spec3", "states": [{"name": "A", "animation": WALK, "node_type": "sequence_evaluator"}, {"name": "B", "node_type": "slot", "slot_name": "DefaultSlot"}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec=json.dumps(spec3))
+r and log("%s spec node types: %s" % ("OK  " if r["states"][1].get("slot_node_guid") and r["states"][0].get("player_node_guid") else "FAIL", r["states"]))
+r = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP2); r and log("%s compile after node types: errors=%d warnings=%d" % ("OK  " if r["num_errors"] == 0 else "FAIL", r["num_errors"], r["num_warnings"]))
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))
