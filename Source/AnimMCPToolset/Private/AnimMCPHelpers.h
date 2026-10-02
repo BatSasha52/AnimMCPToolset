@@ -132,6 +132,9 @@ namespace AnimMCP
 	/** Parses a type string such as "bool", "float", "vector", "object:/Script/Engine.AnimSequence". */
 	bool ParsePinType(const FString& TypeString, FEdGraphPinType& OutType, FString& OutError);
 
+	/** Validates a variable default value string for a pin type using the K2 schema. Empty is always valid. */
+	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError);
+
 	TArray<TSharedPtr<FJsonValue>> ToJsonArray(const TArray<TSharedRef<FJsonObject>>& Objects);
 	TArray<TSharedPtr<FJsonValue>> ToJsonArray(const TArray<FString>& Strings);
 }

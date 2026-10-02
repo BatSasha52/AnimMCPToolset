@@ -122,4 +122,31 @@ public:
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_add_conduit(const FString& blueprint_path, const FString& state_machine_guid, const FString& name, float x = 0.f, float y = 0.f);
+
+	/**
+	 * Builds a whole state machine from one JSON spec in a single undoable step: variables, the state machine node,
+	 * states with their animations, conduits, the entry state, transitions and their rules.
+	 * The whole spec is validated first; if anything is wrong nothing is created and the error lists every problem found.
+	 * Spec (JSON text). Only 'name' and 'states' are required:
+	 * {
+	 *   "name": "Locomotion",              // state machine name
+	 *   "graph": "AnimGraph",              // anim graph to place it in (default AnimGraph)
+	 *   "x": 0, "y": 0,                    // state machine node position
+	 *   "connect_to_output": true,         // wire its Pose to the graph's Output Pose (default false)
+	 *   "variables": [ {"name": "Speed", "type": "float", "default": "0", "category": "Locomotion"} ],
+	 *                                      // created if missing, reused if they already exist with the same type
+	 *   "entry_state": "Idle",             // default: the first state
+	 *   "states": [ {"name": "Idle", "animation": "/Game/Anims/Idle", "loop": true, "play_rate": 1.0, "x": 300, "y": 0} ],
+	 *                                      // animation is optional; positions default to a grid
+	 *   "conduits": [ {"name": "Branch"} ],
+	 *   "transitions": [ {"from": "Idle", "to": "Run", "rule": "compare", "variable": "Speed", "comparison": ">", "threshold": 10,
+	 *                     "crossfade_duration": 0.2} ]
+	 *                                      // rule fields as in anim_set_transition_rule: rule, variable, comparison, threshold, trigger_time
+	 * }
+	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
+	 * @param spec The state machine description as JSON text (see above).
+	 * @return Result: {state_machine, state_machine_graph_guid, entry_node_guid, variables_created, variables_reused, states: [{name, node_guid, player_node_guid}], conduits: [{name, node_guid}], transitions: [{from, to, node_guid, rule, rule_nodes}], warnings}.
+	 */
+	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
+	static FAnimMCPResult anim_build_state_machine(const FString& blueprint_path, const FString& spec);
 };

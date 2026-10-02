@@ -140,5 +140,33 @@ r = ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/BS_Test
 ok("AnimAssetToolset", "anim_remove_variable", blueprint_path=BP, name="Speed", force=True)
 expect_fail("AnimAssetToolset", "anim_remove_variable", blueprint_path=BP, name="bIsMoving")
 
+# --- v0.2 step 2: anim_build_state_machine
+BP2 = "/Game/AMCPTest/ABP_Build"
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Build", skeleton_path=SK)
+spec = {"name": "Loco", "connect_to_output": True,
+        "variables": [{"name": "Speed", "type": "float", "default": "0"}, {"name": "bFalling", "type": "bool"}],
+        "entry_state": "Idle",
+        "states": [{"name": "Idle", "animation": IDLE}, {"name": "Walk", "animation": WALK, "loop": True, "play_rate": 1.5},
+                   {"name": "Land", "animation": IDLE, "loop": False}],
+        "conduits": [{"name": "Air"}],
+        "transitions": [{"from": "Idle", "to": "Walk", "rule": "compare", "variable": "Speed", "comparison": ">", "threshold": 10},
+                        {"from": "Walk", "to": "Idle", "rule": "compare", "variable": "Speed", "comparison": "<=", "threshold": 10},
+                        {"from": "Walk", "to": "Air", "rule": "bool_variable", "variable": "bFalling"},
+                        {"from": "Air", "to": "Land", "rule": "always"},
+                        {"from": "Land", "to": "Idle", "rule": "time_remaining", "trigger_time": 0.2}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec=json.dumps(spec))
+if r:
+    log("%s build result: states=%d conduits=%d transitions=%d vars=%s connected=%s" % (
+        "OK  " if len(r["states"]) == 3 and len(r["transitions"]) == 5 and r["connected_to_output"] else "FAIL",
+        len(r["states"]), len(r["conduits"]), len(r["transitions"]), r["variables_created"], r["connected_to_output"]))
+    walk_player = [s for s in r["states"] if s["name"] == "Walk"][0]["player_node_guid"]
+    n = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP2, node_guid=walk_player); n and log("walk player: %s" % n.get("animation_asset"))
+r = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP2); r and log("%s compile built SM: errors=%d warnings=%d msgs=%s" % ("OK  " if r["num_errors"] == 0 else "FAIL", r["num_errors"], r["num_warnings"], r["messages"][:3]))
+bad = {"name": "Loco2", "states": [{"name": "A", "animation": "/Game/Nope"}], "transitions": [{"from": "A", "to": "B", "rule": "compare", "variable": "Missing"}], "typo": 1}
+expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec=json.dumps(bad))
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP2, graph="AnimGraph")
+r and log("%s nothing created on bad spec: state machines=%d" % ("OK  " if len([x for x in r["nodes"] if x["class"] == "AnimGraphNode_StateMachine"]) == 1 else "FAIL", len([x for x in r["nodes"] if x["class"] == "AnimGraphNode_StateMachine"])))
+expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP2, spec="{not json")
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

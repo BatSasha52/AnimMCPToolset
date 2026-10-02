@@ -77,32 +77,6 @@ namespace
 		return Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass.Get() : Blueprint->GeneratedClass.Get();
 	}
 
-	/** Validates a default value string for a pin type using the K2 schema. */
-	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError)
-	{
-		if (Value.IsEmpty())
-		{
-			return true;
-		}
-		if (!AnimMCP::ValidateBoolText(PinType, Value, OutError))
-		{
-			return false;
-		}
-		const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
-		FString UseDefaultValue;
-		TObjectPtr<UObject> UseDefaultObject = nullptr;
-		FText UseDefaultText;
-		K2Schema->GetPinDefaultValuesFromString(PinType, nullptr, Value, UseDefaultValue, UseDefaultObject, UseDefaultText);
-
-		FString Message;
-		if (!K2Schema->DefaultValueSimpleValidation(PinType, VarName, UseDefaultValue, UseDefaultObject, UseDefaultText, &Message))
-		{
-			OutError = FString::Printf(TEXT("Invalid default '%s' for %s: %s"), *Value, *AnimMCP::PinTypeToString(PinType), *Message);
-			return false;
-		}
-		return true;
-	}
-
 	UObject* CreateAssetWithFactory(const FString& Folder, const FString& AssetName, UClass* AssetClass, UFactory* Factory)
 	{
 		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
@@ -228,7 +202,7 @@ FAnimMCPResult UAnimAssetToolset::anim_add_variable(const FString& blueprint_pat
 	{
 		return AnimMCP::Fail(Error);
 	}
-	if (!ValidateDefaultValue(PinType, VarName, default_value, Error))
+	if (!AnimMCP::ValidateDefaultValue(PinType, VarName, default_value, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
@@ -300,7 +274,7 @@ FAnimMCPResult UAnimAssetToolset::anim_set_variable_default(const FString& bluep
 		return AnimMCP::Fail(FString::Printf(TEXT("'%s' is not a variable declared on this blueprint."), *name));
 	}
 	FBPVariableDescription& Variable = AnimBP->NewVariables[VarIndex];
-	if (!ValidateDefaultValue(Variable.VarType, VarName, value, Error))
+	if (!AnimMCP::ValidateDefaultValue(Variable.VarType, VarName, value, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}

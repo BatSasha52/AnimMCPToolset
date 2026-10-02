@@ -11,6 +11,7 @@
 #include "Animation/Skeleton.h"
 #include "AnimGraphNode_AssetPlayerBase.h"
 #include "AnimGraphNode_BlendSpacePlayer.h"
+#include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_SequencePlayer.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateResult.h"
@@ -22,13 +23,18 @@
 #include "AnimationStateGraph.h"
 #include "AnimationStateMachineGraph.h"
 #include "AnimationTransitionGraph.h"
+#include "Dom/JsonObject.h"
 #include "EdGraph/EdGraphSchema.h"
 #include "EdGraphSchema_K2.h"
+#include "Editor.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_VariableGet.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "Misc/ITransaction.h"
 #include "ScopedTransaction.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 #define LOCTEXT_NAMESPACE "AnimMCPStateMachine"
 
@@ -449,6 +455,133 @@ namespace
 		}
 		return AnimMCP::ToJsonArray(Guids);
 	}
+
+	// ---- State animations ------------------------------------------------------------------
+
+	struct FStateAnimationOptions
+	{
+		bool bLoop = true;
+		float PlayRate = 1.f;
+	};
+
+	/** Loads the asset, checks the skeleton and picks the asset player class for it. */
+	bool ResolveStateAnimation(UAnimBlueprint* AnimBP, const FString& AssetPath, UAnimationAsset*& OutAsset, UClass*& OutPlayerClass, FString& OutError)
+	{
+		OutAsset = AnimMCP::LoadAsset<UAnimationAsset>(AssetPath, /*bForWrite*/ false, OutError);
+		if (!OutAsset)
+		{
+			return false;
+		}
+
+		if (OutAsset->IsA<UAnimMontage>())
+		{
+			OutError = FString::Printf(TEXT("'%s' is a montage. Montages cannot be played by a state. Use an AnimSequence or BlendSpace, or play the montage from a Slot node."), *AssetPath);
+			return false;
+		}
+		else if (OutAsset->IsA<UAnimSequenceBase>())
+		{
+			OutPlayerClass = UAnimGraphNode_SequencePlayer::StaticClass();
+		}
+		else if (OutAsset->IsA<UBlendSpace>())
+		{
+			OutPlayerClass = UAnimGraphNode_BlendSpacePlayer::StaticClass();
+		}
+		else
+		{
+			OutError = FString::Printf(TEXT("'%s' is a %s. States can play AnimSequences or BlendSpaces."), *AssetPath, *OutAsset->GetClass()->GetName());
+			return false;
+		}
+
+		if (AnimBP->TargetSkeleton && OutAsset->GetSkeleton() && !AnimBP->TargetSkeleton->IsCompatibleForEditor(OutAsset->GetSkeleton()))
+		{
+			OutError = FString::Printf(TEXT("'%s' uses skeleton %s, which is not compatible with the blueprint's skeleton %s."),
+				*AssetPath, *OutAsset->GetSkeleton()->GetPathName(), *AnimBP->TargetSkeleton->GetPathName());
+			return false;
+		}
+		return true;
+	}
+
+	/** Sets one member of an anim node's runtime struct the way the details panel does (works for folded properties). */
+	bool SetNodeStructValue(UAnimGraphNode_Base* Node, const FName PropertyName, const FString& Value, FString& OutError)
+	{
+		FStructProperty* NodeProperty = Node->GetFNodeProperty();
+		FProperty* Property = NodeProperty ? FindFProperty<FProperty>(NodeProperty->Struct, PropertyName) : nullptr;
+		if (!Property)
+		{
+			OutError = FString::Printf(TEXT("%s has no property '%s'."), *Node->GetClass()->GetName(), *PropertyName.ToString());
+			return false;
+		}
+		void* NodeData = NodeProperty->ContainerPtrToValuePtr<void>(Node);
+		Node->PreEditChange(NodeProperty);
+		const TCHAR* ImportResult = Property->ImportText_Direct(*Value, Property->ContainerPtrToValuePtr<void>(NodeData), Node, PPF_None);
+		FPropertyChangedEvent ChangedEvent(NodeProperty, EPropertyChangeType::ValueSet);
+		Node->PostEditChangeProperty(ChangedEvent);
+		if (!ImportResult)
+		{
+			OutError = FString::Printf(TEXT("Could not set %s to '%s'."), *PropertyName.ToString(), *Value);
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Replaces the asset player wired to the state's output pose with a new one. The caller owns the transaction.
+	 * Other nodes inside the state are left alone.
+	 */
+	bool ApplyStateAnimation(UAnimBlueprint* AnimBP, UAnimStateNode* State, UAnimationAsset* Asset, UClass* PlayerClass, const FStateAnimationOptions& Options,
+		UAnimGraphNode_Base*& OutPlayer, FString& OutError)
+	{
+		UEdGraph* StateGraph = State->BoundGraph;
+		UEdGraphPin* PoseSink = State->GetPoseSinkPinInsideState();
+		UAnimGraphNode_StateResult* ResultNode = State->GetResultNodeInsideState();
+		if (!StateGraph || !PoseSink || !ResultNode)
+		{
+			OutError = TEXT("State has no inner graph or output pose.");
+			return false;
+		}
+		StateGraph->Modify();
+		ResultNode->Modify();
+
+		// Drop asset players that only fed the output pose; other upstream nodes are left untouched.
+		TArray<UEdGraphNode*> ToRemove;
+		for (UEdGraphPin* Linked : PoseSink->LinkedTo)
+		{
+			UAnimGraphNode_AssetPlayerBase* OldPlayer = Cast<UAnimGraphNode_AssetPlayerBase>(Linked->GetOwningNode());
+			if (OldPlayer && Linked->LinkedTo.Num() == 1)
+			{
+				ToRemove.Add(OldPlayer);
+			}
+		}
+		StateGraph->GetSchema()->BreakPinLinks(*PoseSink, /*bSendsNodeNotifcation*/ true);
+		for (UEdGraphNode* Node : ToRemove)
+		{
+			AnimMCP::RemoveNode(AnimBP, Node);
+		}
+
+		const FVector2D Position(ResultNode->NodePosX - 350.0, ResultNode->NodePosY);
+		UAnimGraphNode_AssetPlayerBase* Player = CastChecked<UAnimGraphNode_AssetPlayerBase>(AnimMCP::SpawnNode(StateGraph, PlayerClass, Position));
+		Player->SetAnimationAsset(Asset);
+		OutPlayer = Player;
+
+		// Only touch settings that differ from the node defaults, so a plain call creates exactly what the editor would.
+		const FName LoopProperty = PlayerClass->IsChildOf(UAnimGraphNode_BlendSpacePlayer::StaticClass()) ? FName(TEXT("bLoop")) : FName(TEXT("bLoopAnimation"));
+		if (!Options.bLoop && !SetNodeStructValue(Player, LoopProperty, TEXT("False"), OutError))
+		{
+			return false;
+		}
+		if (Options.PlayRate != 1.f && !SetNodeStructValue(Player, TEXT("PlayRate"), FString::SanitizeFloat(Options.PlayRate), OutError))
+		{
+			return false;
+		}
+
+		UEdGraphPin* PlayerOut = AnimMCP::FindFirstPin(Player, EGPD_Output);
+		if (!PlayerOut || !StateGraph->GetSchema()->TryCreateConnection(PlayerOut, PoseSink))
+		{
+			OutError = TEXT("Failed to connect the asset player to the state's output pose.");
+			return false;
+		}
+		return true;
+	}
 }
 
 FAnimMCPResult UAnimStateMachineToolset::anim_add_state_machine(const FString& blueprint_path, const FString& graph, const FString& name, float x, float y)
@@ -738,73 +871,23 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	{
 		return AnimMCP::Fail(Error);
 	}
-	UAnimationAsset* Asset = AnimMCP::LoadAsset<UAnimationAsset>(asset_path, /*bForWrite*/ false, Error);
-	if (!Asset)
+	UAnimationAsset* Asset = nullptr;
+	UClass* PlayerClass = nullptr;
+	if (!ResolveStateAnimation(AnimBP, asset_path, Asset, PlayerClass, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
-
-	UClass* PlayerClass = nullptr;
-	if (Asset->IsA<UAnimMontage>())
-	{
-		return AnimMCP::Fail(TEXT("Montages cannot be played by a state. Use an AnimSequence or BlendSpace, or play the montage from a Slot node."));
-	}
-	else if (Asset->IsA<UAnimSequenceBase>())
-	{
-		PlayerClass = UAnimGraphNode_SequencePlayer::StaticClass();
-	}
-	else if (Asset->IsA<UBlendSpace>())
-	{
-		PlayerClass = UAnimGraphNode_BlendSpacePlayer::StaticClass();
-	}
-	else
-	{
-		return AnimMCP::Fail(FString::Printf(TEXT("'%s' is a %s. States can play AnimSequences or BlendSpaces."), *asset_path, *Asset->GetClass()->GetName()));
-	}
-
-	if (AnimBP->TargetSkeleton && Asset->GetSkeleton() && !AnimBP->TargetSkeleton->IsCompatibleForEditor(Asset->GetSkeleton()))
-	{
-		return AnimMCP::Fail(FString::Printf(TEXT("'%s' uses skeleton %s, which is not compatible with the blueprint's skeleton %s."),
-			*asset_path, *Asset->GetSkeleton()->GetPathName(), *AnimBP->TargetSkeleton->GetPathName()));
-	}
-
-	UEdGraph* StateGraph = State->BoundGraph;
-	UEdGraphPin* PoseSink = State->GetPoseSinkPinInsideState();
-	UAnimGraphNode_StateResult* ResultNode = State->GetResultNodeInsideState();
-	if (!StateGraph || !PoseSink || !ResultNode)
+	if (!State->BoundGraph || !State->GetPoseSinkPinInsideState() || !State->GetResultNodeInsideState())
 	{
 		return AnimMCP::Fail(TEXT("State has no inner graph or output pose."));
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetStateAnimation", "AnimMCP: Set State Animation"));
 	AnimBP->Modify();
-	StateGraph->Modify();
-	ResultNode->Modify();
-
-	// Drop asset players that only fed the output pose; other upstream nodes are left untouched.
-	TArray<UEdGraphNode*> ToRemove;
-	for (UEdGraphPin* Linked : PoseSink->LinkedTo)
+	UAnimGraphNode_Base* Player = nullptr;
+	if (!ApplyStateAnimation(AnimBP, State, Asset, PlayerClass, FStateAnimationOptions(), Player, Error))
 	{
-		UAnimGraphNode_AssetPlayerBase* OldPlayer = Cast<UAnimGraphNode_AssetPlayerBase>(Linked->GetOwningNode());
-		if (OldPlayer && Linked->LinkedTo.Num() == 1)
-		{
-			ToRemove.Add(OldPlayer);
-		}
-	}
-	StateGraph->GetSchema()->BreakPinLinks(*PoseSink, /*bSendsNodeNotifcation*/ true);
-	for (UEdGraphNode* Node : ToRemove)
-	{
-		AnimMCP::RemoveNode(AnimBP, Node);
-	}
-
-	const FVector2D Position(ResultNode->NodePosX - 350.0, ResultNode->NodePosY);
-	UAnimGraphNode_AssetPlayerBase* Player = CastChecked<UAnimGraphNode_AssetPlayerBase>(AnimMCP::SpawnNode(StateGraph, PlayerClass, Position));
-	Player->SetAnimationAsset(Asset);
-
-	UEdGraphPin* PlayerOut = AnimMCP::FindFirstPin(Player, EGPD_Output);
-	if (!PlayerOut || !StateGraph->GetSchema()->TryCreateConnection(PlayerOut, PoseSink))
-	{
-		return AnimMCP::Fail(TEXT("Failed to connect the asset player to the state's output pose."));
+		return AnimMCP::Fail(Error);
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
@@ -841,6 +924,614 @@ FAnimMCPResult UAnimStateMachineToolset::anim_add_conduit(const FString& bluepri
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
 	return AnimMCP::Ok(AnimMCP::NodeToJson(Conduit, /*bIncludePins*/ false));
+}
+
+namespace
+{
+	// ---- anim_build_state_machine spec ----------------------------------------------------
+
+	struct FSpecVariable
+	{
+		FName Name;
+		FEdGraphPinType Type;
+		FString Default;
+		FString Category;
+	};
+
+	struct FSpecNode
+	{
+		FString Name;
+		bool bConduit = false;
+		UAnimationAsset* Asset = nullptr;
+		UClass* PlayerClass = nullptr;
+		FStateAnimationOptions Options;
+		TOptional<FVector2D> Position;
+	};
+
+	struct FSpecTransition
+	{
+		int32 From = INDEX_NONE;
+		int32 To = INDEX_NONE;
+		float Crossfade = 0.2f;
+		bool bHasRule = false;
+		FResolvedRule Rule;
+	};
+
+	struct FStateMachineSpec
+	{
+		FString Name;
+		UEdGraph* Graph = nullptr;
+		FVector2D Position = FVector2D::ZeroVector;
+		bool bConnectToOutput = false;
+		UEdGraphPin* OutputPin = nullptr;
+		TArray<FSpecVariable> NewVariables;
+		TArray<FString> ReusedVariables;
+		TArray<FSpecNode> Nodes;  // states first, then conduits
+		int32 EntryIndex = INDEX_NONE;
+		TArray<FSpecTransition> Transitions;
+	};
+
+	/** Reads optional typed fields from a spec object and records every problem instead of stopping at the first. */
+	struct FSpecReader
+	{
+		TArray<FString>& Problems;
+
+		void CheckKeys(const TSharedPtr<FJsonObject>& Object, const FString& Where, const TArray<FString>& Allowed) const
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values)
+			{
+				if (!Allowed.ContainsByPredicate([&Field](const FString& Key) { return Key.Equals(Field.Key, ESearchCase::IgnoreCase); }))
+				{
+					Problems.Add(FString::Printf(TEXT("%s: unknown field '%s'. Allowed: %s."), *Where, *Field.Key, *FString::Join(Allowed, TEXT(", "))));
+				}
+			}
+		}
+
+		TSharedPtr<FJsonValue> Find(const TSharedPtr<FJsonObject>& Object, const FString& Key) const
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values)
+			{
+				if (Field.Key.Equals(Key, ESearchCase::IgnoreCase))
+				{
+					return Field.Value;
+				}
+			}
+			return nullptr;
+		}
+
+		bool String(const TSharedPtr<FJsonObject>& Object, const FString& Where, const FString& Key, FString& Out) const
+		{
+			const TSharedPtr<FJsonValue> Value = Find(Object, Key);
+			if (!Value.IsValid() || Value->IsNull())
+			{
+				return false;
+			}
+			if (Value->Type != EJson::String)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: '%s' must be a string."), *Where, *Key));
+				return false;
+			}
+			Out = Value->AsString();
+			return true;
+		}
+
+		bool Number(const TSharedPtr<FJsonObject>& Object, const FString& Where, const FString& Key, double& Out) const
+		{
+			const TSharedPtr<FJsonValue> Value = Find(Object, Key);
+			if (!Value.IsValid() || Value->IsNull())
+			{
+				return false;
+			}
+			if (Value->Type != EJson::Number)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: '%s' must be a number."), *Where, *Key));
+				return false;
+			}
+			Out = Value->AsNumber();
+			return true;
+		}
+
+		bool Bool(const TSharedPtr<FJsonObject>& Object, const FString& Where, const FString& Key, bool& Out) const
+		{
+			const TSharedPtr<FJsonValue> Value = Find(Object, Key);
+			if (!Value.IsValid() || Value->IsNull())
+			{
+				return false;
+			}
+			if (Value->Type != EJson::Boolean)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: '%s' must be true or false."), *Where, *Key));
+				return false;
+			}
+			Out = Value->AsBool();
+			return true;
+		}
+
+		TArray<TSharedPtr<FJsonObject>> ObjectArray(const TSharedPtr<FJsonObject>& Object, const FString& Key) const
+		{
+			TArray<TSharedPtr<FJsonObject>> Result;
+			const TSharedPtr<FJsonValue> Value = Find(Object, Key);
+			if (!Value.IsValid() || Value->IsNull())
+			{
+				return Result;
+			}
+			if (Value->Type != EJson::Array)
+			{
+				Problems.Add(FString::Printf(TEXT("'%s' must be an array."), *Key));
+				return Result;
+			}
+			const TArray<TSharedPtr<FJsonValue>>& Items = Value->AsArray();
+			for (int32 Index = 0; Index < Items.Num(); ++Index)
+			{
+				if (Items[Index].IsValid() && Items[Index]->Type == EJson::Object)
+				{
+					Result.Add(Items[Index]->AsObject());
+				}
+				else
+				{
+					Problems.Add(FString::Printf(TEXT("%s[%d] must be an object."), *Key, Index));
+				}
+			}
+			return Result;
+		}
+	};
+
+	/** Parses and validates the whole spec against the blueprint. Nothing is modified. Returns false with every problem listed. */
+	bool ParseStateMachineSpec(UAnimBlueprint* AnimBP, const FString& SpecText, FStateMachineSpec& Out, FString& OutError)
+	{
+		TSharedPtr<FJsonObject> Root;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(SpecText);
+		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+		{
+			OutError = FString::Printf(TEXT("spec is not valid JSON: %s"), *Reader->GetErrorMessage());
+			return false;
+		}
+
+		TArray<FString> Problems;
+		const FSpecReader Read{ Problems };
+		Read.CheckKeys(Root, TEXT("spec"), { TEXT("name"), TEXT("graph"), TEXT("x"), TEXT("y"), TEXT("connect_to_output"), TEXT("variables"), TEXT("entry_state"), TEXT("states"), TEXT("conduits"), TEXT("transitions") });
+
+		// State machine node.
+		FString Error;
+		if (!Read.String(Root, TEXT("spec"), TEXT("name"), Out.Name))
+		{
+			Problems.Add(TEXT("spec: 'name' (the state machine name) is required."));
+		}
+		else if (!ValidateName(Out.Name, Error))
+		{
+			Problems.Add(FString::Printf(TEXT("spec.name: %s"), *Error));
+		}
+
+		FString GraphName = TEXT("AnimGraph");
+		Read.String(Root, TEXT("spec"), TEXT("graph"), GraphName);
+		Out.Graph = AnimMCP::FindGraph(AnimBP, GraphName, Error);
+		if (!Out.Graph)
+		{
+			Problems.Add(FString::Printf(TEXT("spec.graph: %s"), *Error));
+		}
+		else if (!GetDefault<UAnimGraphNode_StateMachine>()->CanCreateUnderSpecifiedSchema(Out.Graph->GetSchema()))
+		{
+			Problems.Add(FString::Printf(TEXT("spec.graph: a state machine cannot be placed in '%s'. Use an anim graph such as 'AnimGraph'."), *Out.Graph->GetName()));
+			Out.Graph = nullptr;
+		}
+		if (Out.Graph)
+		{
+			for (const UEdGraphNode* Existing : Out.Graph->Nodes)
+			{
+				const UAnimGraphNode_StateMachineBase* ExistingSM = Cast<UAnimGraphNode_StateMachineBase>(Existing);
+				if (ExistingSM && ExistingSM->EditorStateMachineGraph && ExistingSM->EditorStateMachineGraph->GetName().Equals(Out.Name, ESearchCase::IgnoreCase))
+				{
+					Problems.Add(FString::Printf(TEXT("spec.name: a state machine named '%s' already exists in '%s'."), *Out.Name, *Out.Graph->GetName()));
+				}
+			}
+		}
+
+		double X = 0.0, Y = 0.0;
+		Read.Number(Root, TEXT("spec"), TEXT("x"), X);
+		Read.Number(Root, TEXT("spec"), TEXT("y"), Y);
+		Out.Position = FVector2D(X, Y);
+
+		Read.Bool(Root, TEXT("spec"), TEXT("connect_to_output"), Out.bConnectToOutput);
+		if (Out.bConnectToOutput && Out.Graph)
+		{
+			for (UEdGraphNode* Node : Out.Graph->Nodes)
+			{
+				if (Node && Node->IsA<UAnimGraphNode_Root>())
+				{
+					Out.OutputPin = AnimMCP::FindFirstPin(Node, EGPD_Input);
+					break;
+				}
+			}
+			if (!Out.OutputPin)
+			{
+				Problems.Add(FString::Printf(TEXT("spec.connect_to_output: graph '%s' has no Output Pose node."), *Out.Graph->GetName()));
+			}
+		}
+
+		// Variables.
+		FPendingVariables Pending;
+		const TArray<TSharedPtr<FJsonObject>> Variables = Read.ObjectArray(Root, TEXT("variables"));
+		for (int32 Index = 0; Index < Variables.Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject>& Item = Variables[Index];
+			const FString Where = FString::Printf(TEXT("variables[%d]"), Index);
+			Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("type"), TEXT("default"), TEXT("category") });
+
+			FSpecVariable Variable;
+			FString Name, Type;
+			if (!Read.String(Item, Where, TEXT("name"), Name) || !Read.String(Item, Where, TEXT("type"), Type))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: 'name' and 'type' are required."), *Where));
+				continue;
+			}
+			FText NameError;
+			if (!FName::IsValidXName(Name, INVALID_OBJECTNAME_CHARACTERS, &NameError))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: '%s' is not a valid variable name. %s"), *Where, *Name, *NameError.ToString()));
+				continue;
+			}
+			Variable.Name = FName(*Name);
+			if (!AnimMCP::ParsePinType(Type, Variable.Type, Error))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+				continue;
+			}
+			if (Pending.Contains(Variable.Name) || Out.ReusedVariables.Contains(Name))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: variable '%s' is listed twice."), *Where, *Name));
+				continue;
+			}
+
+			const EVariableKind Existing = GetVariableKind(AnimBP, Variable.Name, nullptr);
+			if (Existing != EVariableKind::Missing)
+			{
+				// Already there: reuse it if it holds the same kind of value.
+				if (Existing != KindFromPinType(Variable.Type) || Existing == EVariableKind::Other)
+				{
+					Problems.Add(FString::Printf(TEXT("%s: '%s' already exists with a different type. Remove it, pick another name, or leave it out of 'variables' to use it as is."), *Where, *Name));
+				}
+				else
+				{
+					Out.ReusedVariables.Add(Name);
+				}
+				continue;
+			}
+
+			FString Default;
+			if (Read.String(Item, Where, TEXT("default"), Default) && AnimMCP::IsUnset(Default))
+			{
+				Default.Reset();
+			}
+			if (!AnimMCP::ValidateDefaultValue(Variable.Type, Variable.Name, Default, Error))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+				continue;
+			}
+			Variable.Default = Default;
+			Read.String(Item, Where, TEXT("category"), Variable.Category);
+			Pending.Add(Variable.Name, Variable.Type);
+			Out.NewVariables.Add(MoveTemp(Variable));
+		}
+
+		// States and conduits share one name space.
+		auto ReadNodes = [&](const TCHAR* Key, bool bConduit)
+		{
+			const TArray<TSharedPtr<FJsonObject>> Items = Read.ObjectArray(Root, Key);
+			for (int32 Index = 0; Index < Items.Num(); ++Index)
+			{
+				const TSharedPtr<FJsonObject>& Item = Items[Index];
+				const FString Where = FString::Printf(TEXT("%s[%d]"), Key, Index);
+				if (bConduit)
+				{
+					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("x"), TEXT("y") });
+				}
+				else
+				{
+					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("animation"), TEXT("loop"), TEXT("play_rate"), TEXT("x"), TEXT("y") });
+				}
+
+				FSpecNode Node;
+				Node.bConduit = bConduit;
+				if (!Read.String(Item, Where, TEXT("name"), Node.Name))
+				{
+					Problems.Add(FString::Printf(TEXT("%s: 'name' is required."), *Where));
+					continue;
+				}
+				if (!ValidateName(Node.Name, Error))
+				{
+					Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+					continue;
+				}
+				if (Out.Nodes.ContainsByPredicate([&Node](const FSpecNode& Other) { return Other.Name.Equals(Node.Name, ESearchCase::IgnoreCase); }))
+				{
+					Problems.Add(FString::Printf(TEXT("%s: the name '%s' is used twice (state and conduit names must be unique)."), *Where, *Node.Name));
+					continue;
+				}
+
+				double NodeX = 0.0, NodeY = 0.0;
+				const bool bHasX = Read.Number(Item, Where, TEXT("x"), NodeX);
+				const bool bHasY = Read.Number(Item, Where, TEXT("y"), NodeY);
+				if (bHasX || bHasY)
+				{
+					Node.Position = FVector2D(NodeX, NodeY);
+				}
+
+				if (!bConduit)
+				{
+					FString AnimationPath;
+					if (Read.String(Item, Where, TEXT("animation"), AnimationPath) && !AnimMCP::IsUnset(AnimationPath)
+						&& !ResolveStateAnimation(AnimBP, AnimationPath, Node.Asset, Node.PlayerClass, Error))
+					{
+						Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+					}
+					Read.Bool(Item, Where, TEXT("loop"), Node.Options.bLoop);
+					double PlayRate = 1.0;
+					if (Read.Number(Item, Where, TEXT("play_rate"), PlayRate))
+					{
+						Node.Options.PlayRate = (float)PlayRate;
+					}
+					if ((!Node.Options.bLoop || Node.Options.PlayRate != 1.f) && AnimMCP::IsUnset(AnimationPath))
+					{
+						Problems.Add(FString::Printf(TEXT("%s: 'loop' and 'play_rate' need an 'animation'."), *Where));
+					}
+				}
+				Out.Nodes.Add(MoveTemp(Node));
+			}
+		};
+		ReadNodes(TEXT("states"), /*bConduit*/ false);
+		const int32 NumStates = Out.Nodes.Num();
+		ReadNodes(TEXT("conduits"), /*bConduit*/ true);
+		if (NumStates == 0)
+		{
+			Problems.Add(TEXT("spec: 'states' must contain at least one state."));
+		}
+
+		auto FindNodeIndex = [&Out](const FString& Name)
+		{
+			return Out.Nodes.IndexOfByPredicate([&Name](const FSpecNode& Node) { return Node.Name.Equals(Name, ESearchCase::IgnoreCase); });
+		};
+
+		FString EntryName;
+		if (Read.String(Root, TEXT("spec"), TEXT("entry_state"), EntryName))
+		{
+			Out.EntryIndex = FindNodeIndex(EntryName);
+			if (Out.EntryIndex == INDEX_NONE || Out.Nodes[Out.EntryIndex].bConduit)
+			{
+				Problems.Add(FString::Printf(TEXT("spec.entry_state: '%s' is not one of the states."), *EntryName));
+				Out.EntryIndex = INDEX_NONE;
+			}
+		}
+		else if (NumStates > 0)
+		{
+			Out.EntryIndex = 0;
+		}
+
+		// Transitions.
+		const TArray<TSharedPtr<FJsonObject>> Transitions = Read.ObjectArray(Root, TEXT("transitions"));
+		for (int32 Index = 0; Index < Transitions.Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject>& Item = Transitions[Index];
+			const FString Where = FString::Printf(TEXT("transitions[%d]"), Index);
+			Read.CheckKeys(Item, Where, { TEXT("from"), TEXT("to"), TEXT("crossfade_duration"), TEXT("rule"), TEXT("variable"), TEXT("variable_name"), TEXT("comparison"), TEXT("threshold"), TEXT("trigger_time") });
+
+			FSpecTransition Transition;
+			FString From, To;
+			if (!Read.String(Item, Where, TEXT("from"), From) || !Read.String(Item, Where, TEXT("to"), To))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: 'from' and 'to' are required."), *Where));
+				continue;
+			}
+			Transition.From = FindNodeIndex(From);
+			Transition.To = FindNodeIndex(To);
+			if (Transition.From == INDEX_NONE)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: 'from' state '%s' is not in the spec."), *Where, *From));
+			}
+			if (Transition.To == INDEX_NONE)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: 'to' state '%s' is not in the spec."), *Where, *To));
+			}
+
+			double Crossfade = 0.2;
+			if (Read.Number(Item, Where, TEXT("crossfade_duration"), Crossfade) && Crossfade < 0.0)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: crossfade_duration must be >= 0."), *Where));
+			}
+			Transition.Crossfade = (float)Crossfade;
+
+			FRuleRequest Request;
+			if (Read.String(Item, Where, TEXT("rule"), Request.Rule))
+			{
+				if (!Read.String(Item, Where, TEXT("variable"), Request.VariableName))
+				{
+					Read.String(Item, Where, TEXT("variable_name"), Request.VariableName);
+				}
+				Read.String(Item, Where, TEXT("comparison"), Request.Comparison);
+				Read.Number(Item, Where, TEXT("threshold"), Request.Threshold);
+				double TriggerTime = -1.0;
+				if (Read.Number(Item, Where, TEXT("trigger_time"), TriggerTime))
+				{
+					Request.TriggerTime = (float)TriggerTime;
+				}
+				if (ResolveRule(AnimBP, Request, Transition.Rule, Error, &Pending))
+				{
+					Transition.bHasRule = true;
+				}
+				else
+				{
+					Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+				}
+			}
+			Out.Transitions.Add(Transition);
+		}
+
+		if (!Problems.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Nothing was created. The spec has %d problem(s):\n- %s"), Problems.Num(), *FString::Join(Problems, TEXT("\n- ")));
+			return false;
+		}
+		return true;
+	}
+
+	/** Creates everything the validated spec describes. The caller owns the transaction. */
+	bool ApplyStateMachineSpec(UAnimBlueprint* AnimBP, const FStateMachineSpec& Spec, const TSharedRef<FJsonObject>& Payload, FString& OutError)
+	{
+		AnimBP->Modify();
+
+		// Variables first, so rule getters can find them. Marking the blueprint structurally modified regenerates the skeleton class.
+		TArray<FString> CreatedVariables;
+		for (const FSpecVariable& Variable : Spec.NewVariables)
+		{
+			if (!FBlueprintEditorUtils::AddMemberVariable(AnimBP, Variable.Name, Variable.Type, Variable.Default))
+			{
+				OutError = FString::Printf(TEXT("Failed to add variable '%s'."), *Variable.Name.ToString());
+				return false;
+			}
+			if (!AnimMCP::IsUnset(Variable.Category) && !Variable.Category.Equals(TEXT("Default"), ESearchCase::IgnoreCase))
+			{
+				FBlueprintEditorUtils::SetBlueprintVariableCategory(AnimBP, Variable.Name, nullptr, FText::FromString(Variable.Category));
+			}
+			CreatedVariables.Add(Variable.Name.ToString());
+		}
+		if (!CreatedVariables.IsEmpty())
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+		}
+
+		// State machine node.
+		UEdGraphNode* MachineNode = AnimMCP::SpawnNode(Spec.Graph, UAnimGraphNode_StateMachine::StaticClass(), Spec.Position);
+		MachineNode->OnRenameNode(Spec.Name);
+		UAnimationStateMachineGraph* SMGraph = CastChecked<UAnimGraphNode_StateMachineBase>(MachineNode)->EditorStateMachineGraph;
+		if (!SMGraph || !SMGraph->EntryNode)
+		{
+			OutError = TEXT("The new state machine has no graph or Entry node.");
+			return false;
+		}
+		if (Spec.OutputPin)
+		{
+			UEdGraphPin* PosePin = AnimMCP::FindFirstPin(MachineNode, EGPD_Output);
+			Spec.OutputPin->GetOwningNode()->Modify();
+			if (!PosePin || !Spec.Graph->GetSchema()->TryCreateConnection(PosePin, Spec.OutputPin))
+			{
+				OutError = TEXT("Failed to connect the state machine to the Output Pose.");
+				return false;
+			}
+		}
+
+		// States and conduits, laid out on a grid unless the spec gives positions.
+		TArray<UAnimStateNodeBase*> Created;
+		TArray<TSharedRef<FJsonObject>> StateItems;
+		TArray<TSharedRef<FJsonObject>> ConduitItems;
+		for (int32 Index = 0; Index < Spec.Nodes.Num(); ++Index)
+		{
+			const FSpecNode& Node = Spec.Nodes[Index];
+			const FVector2D Position = Node.Position.Get(FVector2D(300.0 + 350.0 * (Index % 4), 250.0 * (Index / 4)));
+			UClass* NodeClass = Node.bConduit ? UAnimStateConduitNode::StaticClass() : UAnimStateNode::StaticClass();
+			UAnimStateNodeBase* StateNode = CastChecked<UAnimStateNodeBase>(SpawnNamedStateNode(SMGraph, NodeClass, Node.Name, Position));
+			Created.Add(StateNode);
+
+			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("name"), StateNode->GetStateName());
+			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(StateNode->NodeGuid));
+			if (Node.Asset)
+			{
+				UAnimGraphNode_Base* Player = nullptr;
+				if (!ApplyStateAnimation(AnimBP, CastChecked<UAnimStateNode>(StateNode), Node.Asset, Node.PlayerClass, Node.Options, Player, OutError))
+				{
+					OutError = FString::Printf(TEXT("State '%s': %s"), *Node.Name, *OutError);
+					return false;
+				}
+				Item->SetStringField(TEXT("player_node_guid"), AnimMCP::GuidToString(Player->NodeGuid));
+				Item->SetStringField(TEXT("animation"), Node.Asset->GetPathName());
+			}
+			(Node.bConduit ? ConduitItems : StateItems).Add(Item);
+		}
+
+		if (Spec.EntryIndex != INDEX_NONE)
+		{
+			UEdGraphPin* EntryPin = SMGraph->EntryNode->GetOutputPin();
+			SMGraph->EntryNode->Modify();
+			if (!SMGraph->GetSchema()->TryCreateConnection(EntryPin, Created[Spec.EntryIndex]->GetInputPin()))
+			{
+				OutError = FString::Printf(TEXT("Failed to wire Entry to state '%s'."), *Spec.Nodes[Spec.EntryIndex].Name);
+				return false;
+			}
+		}
+
+		TArray<TSharedRef<FJsonObject>> TransitionItems;
+		for (const FSpecTransition& SpecTransition : Spec.Transitions)
+		{
+			UAnimStateNodeBase* From = Created[SpecTransition.From];
+			UAnimStateNodeBase* To = Created[SpecTransition.To];
+			const FVector2D Midpoint((From->NodePosX + To->NodePosX) * 0.5, (From->NodePosY + To->NodePosY) * 0.5);
+			UAnimStateTransitionNode* Transition = CastChecked<UAnimStateTransitionNode>(AnimMCP::SpawnNode(SMGraph, UAnimStateTransitionNode::StaticClass(), Midpoint));
+			Transition->CreateConnections(From, To);
+			Transition->CrossfadeDuration = SpecTransition.Crossfade;
+
+			TArray<UEdGraphNode*> RuleNodes;
+			if (SpecTransition.bHasRule && !ApplyRule(AnimBP, Transition, SpecTransition.Rule, RuleNodes, OutError))
+			{
+				OutError = FString::Printf(TEXT("Transition %s -> %s: %s"), *From->GetStateName(), *To->GetStateName(), *OutError);
+				return false;
+			}
+
+			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("from"), From->GetStateName());
+			Item->SetStringField(TEXT("to"), To->GetStateName());
+			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Transition->NodeGuid));
+			Item->SetStringField(TEXT("rule"), SpecTransition.bHasRule ? RuleKindToString(SpecTransition.Rule.Kind) : FString(TEXT("never")));
+			Item->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+			TransitionItems.Add(Item);
+		}
+
+		Payload->SetObjectField(TEXT("state_machine"), AnimMCP::NodeToJson(MachineNode, /*bIncludePins*/ false));
+		Payload->SetStringField(TEXT("state_machine_graph_guid"), AnimMCP::GuidToString(SMGraph->GraphGuid));
+		Payload->SetStringField(TEXT("entry_node_guid"), AnimMCP::GuidToString(SMGraph->EntryNode->NodeGuid));
+		Payload->SetBoolField(TEXT("connected_to_output"), Spec.OutputPin != nullptr);
+		Payload->SetArrayField(TEXT("variables_created"), AnimMCP::ToJsonArray(CreatedVariables));
+		Payload->SetArrayField(TEXT("variables_reused"), AnimMCP::ToJsonArray(Spec.ReusedVariables));
+		Payload->SetArrayField(TEXT("states"), AnimMCP::ToJsonArray(StateItems));
+		Payload->SetArrayField(TEXT("conduits"), AnimMCP::ToJsonArray(ConduitItems));
+		Payload->SetArrayField(TEXT("transitions"), AnimMCP::ToJsonArray(TransitionItems));
+		return true;
+	}
+}
+
+FAnimMCPResult UAnimStateMachineToolset::anim_build_state_machine(const FString& blueprint_path, const FString& spec)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	UAnimBlueprint* AnimBP = AnimMCP::LoadAsset<UAnimBlueprint>(blueprint_path, /*bForWrite*/ true, Error);
+	if (!AnimBP)
+	{
+		return AnimMCP::Fail(Error);
+	}
+
+	FStateMachineSpec Spec;
+	if (!ParseStateMachineSpec(AnimBP, spec, Spec, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+
+	// Rolling back with undo is only safe when this is the outermost transaction.
+	const bool bCanRollBack = GEditor && !GUndo;
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	bool bApplied = false;
+	{
+		const FScopedTransaction Transaction(LOCTEXT("BuildStateMachine", "AnimMCP: Build State Machine"));
+		bApplied = ApplyStateMachineSpec(AnimBP, Spec, Payload, Error);
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
+	}
+	if (!bApplied)
+	{
+		const bool bRolledBack = bCanRollBack && GEditor->UndoTransaction(/*bCanRedo*/ false);
+		return AnimMCP::Fail(FString::Printf(TEXT("Building the state machine failed: %s %s"), *Error,
+			bRolledBack ? TEXT("All changes were rolled back.") : TEXT("Partial changes remain; press Ctrl+Z in the editor to undo them.")));
+	}
+
+	Payload->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
+	return AnimMCP::Ok(Payload);
 }
 
 #undef LOCTEXT_NAMESPACE

@@ -721,6 +721,31 @@ namespace AnimMCP
 		return true;
 	}
 
+	bool ValidateDefaultValue(const FEdGraphPinType& PinType, const FName VarName, const FString& Value, FString& OutError)
+	{
+		if (Value.IsEmpty())
+		{
+			return true;
+		}
+		if (!ValidateBoolText(PinType, Value, OutError))
+		{
+			return false;
+		}
+		const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+		FString UseDefaultValue;
+		TObjectPtr<UObject> UseDefaultObject = nullptr;
+		FText UseDefaultText;
+		K2Schema->GetPinDefaultValuesFromString(PinType, nullptr, Value, UseDefaultValue, UseDefaultObject, UseDefaultText);
+
+		FString Message;
+		if (!K2Schema->DefaultValueSimpleValidation(PinType, VarName, UseDefaultValue, UseDefaultObject, UseDefaultText, &Message))
+		{
+			OutError = FString::Printf(TEXT("Invalid default '%s' for %s: %s"), *Value, *PinTypeToString(PinType), *Message);
+			return false;
+		}
+		return true;
+	}
+
 	TArray<TSharedPtr<FJsonValue>> ToJsonArray(const TArray<TSharedRef<FJsonObject>>& Objects)
 	{
 		TArray<TSharedPtr<FJsonValue>> Out;
