@@ -65,6 +65,21 @@ namespace AnimMCP
 		return false;
 	}
 
+	bool NormalizeFolder(const FString& InFolder, FString& OutFolder, FString& OutError)
+	{
+		OutFolder = IsUnset(InFolder) ? FString(TEXT("/Game")) : InFolder.TrimStartAndEnd();
+		while (OutFolder.Len() > 1 && OutFolder.EndsWith(TEXT("/")))
+		{
+			OutFolder.LeftChopInline(1);
+		}
+		if (!OutFolder.StartsWith(TEXT("/")) || OutFolder.Len() < 2)
+		{
+			OutError = FString::Printf(TEXT("'%s' is not a content folder. Use a path such as '/Game' or '/Game/Characters'."), *InFolder);
+			return false;
+		}
+		return true;
+	}
+
 	void EnsureFolderScanned(const FString& Folder)
 	{
 		if (Folder.StartsWith(TEXT("/")))

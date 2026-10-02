@@ -60,12 +60,17 @@ FAnimMCPResult UAnimInspectToolset::anim_list_anim_blueprints(const FString& fol
 		}
 	}
 
-	AnimMCP::EnsureFolderScanned(folder.IsEmpty() ? FString(TEXT("/Game")) : folder);
+	FString Folder;
+	if (!AnimMCP::NormalizeFolder(folder, Folder, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+	AnimMCP::EnsureFolderScanned(Folder);
 
 	FARFilter Filter;
 	Filter.ClassPaths.Add(UAnimBlueprint::StaticClass()->GetClassPathName());
 	Filter.bRecursiveClasses = true;
-	Filter.PackagePaths.Add(FName(*(folder.IsEmpty() ? FString(TEXT("/Game")) : folder)));
+	Filter.PackagePaths.Add(FName(*Folder));
 	Filter.bRecursivePaths = true;
 
 	TArray<FAssetData> Assets;
@@ -276,12 +281,17 @@ FAnimMCPResult UAnimInspectToolset::anim_list_animation_assets(const FString& sk
 		FilterClass = Found;
 	}
 
-	AnimMCP::EnsureFolderScanned(folder.IsEmpty() ? FString(TEXT("/Game")) : folder);
+	FString Folder;
+	if (!AnimMCP::NormalizeFolder(folder, Folder, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+	AnimMCP::EnsureFolderScanned(Folder);
 
 	FARFilter Filter;
 	Filter.ClassPaths.Add(FilterClass->GetClassPathName());
 	Filter.bRecursiveClasses = true;
-	Filter.PackagePaths.Add(FName(*(folder.IsEmpty() ? FString(TEXT("/Game")) : folder)));
+	Filter.PackagePaths.Add(FName(*Folder));
 	Filter.bRecursivePaths = true;
 
 	TArray<FAssetData> Assets;

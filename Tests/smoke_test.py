@@ -271,5 +271,20 @@ expect_fail("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCP
 r = ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Plain", skeleton_path=SK)
 r and log("%s default create has no locomotion setup: %s" % ("OK  " if "locomotion_variables" not in r else "FAIL", sorted(r.keys())))
 
+# --- v0.2: listing checks (the ABP_Batman report)
+r = ok("AnimInspectToolset", "anim_list_anim_blueprints", folder="/Game/AMCPTest/")
+names = sorted(a["name"] for a in r["anim_blueprints"]) if r else []
+log("%s trailing slash and unsaved new ABPs listed: %s" % ("OK  " if {"ABP_Test", "ABP_Build", "ABP_Loco", "ABP_Plain"} <= set(names) else "FAIL", names))
+expect_fail("AnimInspectToolset", "anim_list_anim_blueprints", folder="Game/AMCPTest")
+
+# --- v0.2 step 6: name resolution. The registry schema (what describe_toolset prints) uses qualified names,
+# but tools are looked up by their short name, so the qualified name is rejected. Engine behaviour, documented in the README.
+qualified = [t["name"] for s in schemas if s["name"] == "AnimMCPToolset.AnimInspectToolset" for t in s["tools"] if t["name"].endswith("anim_list_anim_blueprints")]
+rq = unreal.ToolsetRegistry.execute_tool("AnimMCPToolset.AnimInspectToolset", qualified[0] if qualified else "", "{}")
+rs = unreal.ToolsetRegistry.execute_tool("AnimMCPToolset.AnimInspectToolset", "anim_list_anim_blueprints", "{}")
+log("%s qualified tool name: schema=%s qualified_error=%r short_error=%r" % (
+    "OK  " if qualified and qualified[0].startswith("AnimMCPToolset.") and "Unknown tool" in (rq.error or "") and not rs.error else "FAIL",
+    qualified, rq.error, rs.error))
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))
