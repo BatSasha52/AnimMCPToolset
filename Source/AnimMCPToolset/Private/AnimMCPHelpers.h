@@ -126,6 +126,36 @@ namespace AnimMCP
 	/** Gets the blueprint that owns the graph the node lives in. */
 	UBlueprint* GetOwningBlueprint(const UEdGraphNode* Node);
 
+	/**
+	 * Resolves a node class name ('AnimGraphNode_Slot', 'K2Node_VariableGet' or a full class path) to a class that
+	 * can be placed by hand. Result/entry nodes and state machine states/transitions are rejected.
+	 */
+	UClass* ResolveNodeClass(const FString& Name, FString& OutError);
+
+	// ---- Properties ------------------------------------------------------------------------
+
+	struct FResolvedProperty
+	{
+		FProperty* TopProperty = nullptr;
+		FProperty* LeafProperty = nullptr;
+		void* LeafValue = nullptr;
+	};
+
+	/**
+	 * Walks 'A.B[2].C' from Object down to the leaf value. Every segment must be editor-visible.
+	 * On anim graph nodes 'Node' always means the node's runtime struct.
+	 */
+	bool ResolvePropertyPath(UObject* Object, const FString& Path, FResolvedProperty& Out, FString& OutError);
+
+	/** Checks that Value parses for the property at Path without touching Object (imports into a scratch copy). */
+	bool CanImportPropertyValue(UObject* Object, const FString& Path, const FString& Value, FString& OutError);
+
+	/**
+	 * Sets a property on a node the way the details panel does (PreEditChange, import, PostEditChangeProperty, ReconstructNode).
+	 * The caller owns the transaction. OutReadBack receives the value as stored after the change.
+	 */
+	bool SetNodePropertyByPath(UEdGraphNode* Node, const FString& Path, const FString& Value, FString& OutReadBack, FString& OutError);
+
 	// ---- Serialization ---------------------------------------------------------------------
 
 	FString GuidToString(const FGuid& Guid);

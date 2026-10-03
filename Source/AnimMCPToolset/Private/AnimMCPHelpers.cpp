@@ -6,10 +6,17 @@
 #include "Animation/AnimationAsset.h"
 #include "Animation/Skeleton.h"
 #include "AnimGraphNode_AssetPlayerBase.h"
+#include "AnimGraphNode_CustomTransitionResult.h"
+#include "AnimGraphNode_Root.h"
 #include "AnimGraphNode_StateMachineBase.h"
+#include "AnimGraphNode_StateResult.h"
+#include "AnimGraphNode_TransitionResult.h"
+#include "AnimStateEntryNode.h"
 #include "AnimStateNodeBase.h"
 #include "AnimStateTransitionNode.h"
 #include "AnimationStateMachineGraph.h"
+#include "AlphaBlend.h"
+#include "Curves/CurveFloat.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "EdGraph/EdGraph.h"
@@ -20,6 +27,7 @@
 #include "Engine/SkeletalMesh.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Misc/PackageName.h"
+#include "Misc/StringOutputDevice.h"
 #include "UObject/Package.h"
 
 DEFINE_LOG_CATEGORY(LogAnimMCP);
@@ -487,6 +495,205 @@ namespace AnimMCP
 		return Node ? FBlueprintEditorUtils::FindBlueprintForGraph(Node->GetGraph()) : nullptr;
 	}
 
+	UClass* ResolveNodeClass(const FString& Name, FString& OutError)
+	{
+		const FString Trimmed = Name.TrimStartAndEnd();
+		UClass* Class = nullptr;
+		if (Trimmed.StartsWith(TEXT("/")))
+		{
+			Class = FindObject<UClass>(nullptr, *Trimmed);
+			if (!Class)
+			{
+				Class = LoadObject<UClass>(nullptr, *Trimmed);
+			}
+		}
+		else
+		{
+			Class = FindFirstObject<UClass>(*Trimmed, EFindFirstObjectOptions::NativeFirst);
+			if (!Class && Trimmed.StartsWith(TEXT("U")))
+			{
+				Class = FindFirstObject<UClass>(*Trimmed.RightChop(1), EFindFirstObjectOptions::NativeFirst);
+			}
+		}
+
+		if (!Class || !Class->IsChildOf(UEdGraphNode::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("'%s' is not a graph node class. Use anim_list_node_types to see valid anim node classes."), *Name);
+			return nullptr;
+		}
+		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+		{
+			OutError = FString::Printf(TEXT("'%s' is abstract or deprecated and cannot be placed."), *Name);
+			return nullptr;
+		}
+		if (Class->IsChildOf(UAnimGraphNode_Root::StaticClass())
+			|| Class->IsChildOf(UAnimGraphNode_StateResult::StaticClass())
+			|| Class->IsChildOf(UAnimGraphNode_TransitionResult::StaticClass())
+			|| Class->IsChildOf(UAnimGraphNode_CustomTransitionResult::StaticClass())
+			|| Class->IsChildOf(UAnimStateEntryNode::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("'%s' is a result/entry node that the editor creates automatically; it cannot be added manually."), *Name);
+			return nullptr;
+		}
+		if (Class->IsChildOf(UAnimStateNodeBase::StaticClass()))
+		{
+			OutError = TEXT("States, conduits and transitions must be created with anim_add_state, anim_add_conduit and anim_add_transition.");
+			return nullptr;
+		}
+		return Class;
+	}
+
+	// ---- Properties ------------------------------------------------------------------------
+
+	bool ResolvePropertyPath(UObject* Object, const FString& Path, FResolvedProperty& Out, FString& OutError)
+	{
+		TArray<FString> Segments;
+		Path.ParseIntoArray(Segments, TEXT("."));
+		if (Segments.IsEmpty())
+		{
+			OutError = TEXT("property_path is empty.");
+			return false;
+		}
+
+		UStruct* Struct = Object->GetClass();
+		void* Container = Object;
+		for (int32 Index = 0; Index < Segments.Num(); ++Index)
+		{
+			FString Name = Segments[Index];
+			int32 ArrayIndex = INDEX_NONE;
+			int32 BracketPos;
+			if (Name.FindChar(TEXT('['), BracketPos) && Name.EndsWith(TEXT("]")))
+			{
+				const FString IndexText = Name.Mid(BracketPos + 1, Name.Len() - BracketPos - 2);
+				if (!IndexText.IsNumeric())
+				{
+					OutError = FString::Printf(TEXT("Invalid array index in '%s'."), *Segments[Index]);
+					return false;
+				}
+				ArrayIndex = FCString::Atoi(*IndexText);
+				Name.LeftInline(BracketPos);
+			}
+
+			FProperty* Property = FindFProperty<FProperty>(Struct, FName(*Name));
+			if (!Property && Index == 0 && Name == TEXT("Node"))
+			{
+				if (const UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Object))
+				{
+					Property = AnimNode->GetFNodeProperty();
+				}
+			}
+			if (!Property)
+			{
+				TArray<FString> Available;
+				for (TFieldIterator<FProperty> It(Struct); It; ++It)
+				{
+					if (It->HasAnyPropertyFlags(CPF_Edit))
+					{
+						Available.Add(It->GetName());
+					}
+				}
+				OutError = FString::Printf(TEXT("Property '%s' not found on %s. Editable properties: %s"),
+					*Name, *Struct->GetName(), *FString::Join(Available, TEXT(", ")));
+				return false;
+			}
+			if (!Property->HasAnyPropertyFlags(CPF_Edit) || Property->HasAnyPropertyFlags(CPF_EditConst))
+			{
+				OutError = FString::Printf(TEXT("Property '%s' is not editable."), *Name);
+				return false;
+			}
+			if (Index == 0)
+			{
+				Out.TopProperty = Property;
+			}
+
+			void* Value = Property->ContainerPtrToValuePtr<void>(Container);
+			if (ArrayIndex != INDEX_NONE)
+			{
+				FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property);
+				if (!ArrayProperty)
+				{
+					OutError = FString::Printf(TEXT("'%s' is not an array."), *Name);
+					return false;
+				}
+				FScriptArrayHelper Helper(ArrayProperty, Value);
+				if (!Helper.IsValidIndex(ArrayIndex))
+				{
+					OutError = FString::Printf(TEXT("Index %d out of range for '%s' (size %d)."), ArrayIndex, *Name, Helper.Num());
+					return false;
+				}
+				Value = Helper.GetRawPtr(ArrayIndex);
+				Property = ArrayProperty->Inner;
+			}
+
+			if (Index == Segments.Num() - 1)
+			{
+				Out.LeafProperty = Property;
+				Out.LeafValue = Value;
+				return true;
+			}
+
+			FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+			if (!StructProperty)
+			{
+				OutError = FString::Printf(TEXT("'%s' is not a struct, so '%s' cannot be resolved inside it."), *Name, *Segments[Index + 1]);
+				return false;
+			}
+			Struct = StructProperty->Struct;
+			Container = Value;
+		}
+		return false;
+	}
+
+	bool CanImportPropertyValue(UObject* Object, const FString& Path, const FString& Value, FString& OutError)
+	{
+		FResolvedProperty Resolved;
+		if (!ResolvePropertyPath(Object, Path, Resolved, OutError))
+		{
+			return false;
+		}
+
+		FStringOutputDevice ImportErrors;
+		void* Scratch = FMemory::Malloc(Resolved.LeafProperty->GetElementSize(), Resolved.LeafProperty->GetMinAlignment());
+		Resolved.LeafProperty->InitializeValue(Scratch);
+		Resolved.LeafProperty->CopySingleValue(Scratch, Resolved.LeafValue);
+		const TCHAR* ImportResult = Resolved.LeafProperty->ImportText_Direct(*Value, Scratch, Object, PPF_None, &ImportErrors);
+		Resolved.LeafProperty->DestroyValue(Scratch);
+		FMemory::Free(Scratch);
+		if (!ImportResult || !ImportErrors.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Could not parse '%s' for %s (%s). %s"),
+				*Value, *Path, *Resolved.LeafProperty->GetCPPType(), *ImportErrors);
+			return false;
+		}
+		return true;
+	}
+
+	bool SetNodePropertyByPath(UEdGraphNode* Node, const FString& Path, const FString& Value, FString& OutReadBack, FString& OutError)
+	{
+		// Import into a scratch copy first so a bad value never touches the node.
+		if (!CanImportPropertyValue(Node, Path, Value, OutError))
+		{
+			return false;
+		}
+		FResolvedProperty Resolved;
+		ResolvePropertyPath(Node, Path, Resolved, OutError);
+
+		Node->Modify();
+		Node->PreEditChange(Resolved.TopProperty);
+		Resolved.LeafProperty->ImportText_Direct(*Value, Resolved.LeafValue, Node, PPF_None);
+		FPropertyChangedEvent ChangedEvent(Resolved.TopProperty, EPropertyChangeType::ValueSet);
+		Node->PostEditChangeProperty(ChangedEvent);
+		Node->ReconstructNode();
+
+		// Re-resolve: ReconstructNode may have reallocated storage.
+		OutReadBack.Reset();
+		if (ResolvePropertyPath(Node, Path, Resolved, OutError))
+		{
+			Resolved.LeafProperty->ExportTextItem_Direct(OutReadBack, Resolved.LeafValue, nullptr, Node, PPF_None);
+		}
+		return true;
+	}
+
 	// ---- Serialization ---------------------------------------------------------------------
 
 	FString GuidToString(const FGuid& Guid)
@@ -591,6 +798,11 @@ namespace AnimMCP
 			}
 			Json->SetNumberField(TEXT("crossfade_duration"), Transition->CrossfadeDuration);
 			Json->SetNumberField(TEXT("priority_order"), Transition->PriorityOrder);
+			Json->SetStringField(TEXT("blend_mode"), StaticEnum<EAlphaBlendOption>()->GetNameStringByValue((int64)Transition->BlendMode));
+			if (Transition->CustomBlendCurve)
+			{
+				Json->SetStringField(TEXT("blend_curve"), Transition->CustomBlendCurve->GetPathName());
+			}
 			Json->SetBoolField(TEXT("automatic_rule"), Transition->bAutomaticRuleBasedOnSequencePlayerInState);
 			Json->SetNumberField(TEXT("automatic_rule_trigger_time"), Transition->AutomaticRuleTriggerTime);
 		}

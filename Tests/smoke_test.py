@@ -34,8 +34,16 @@ def expect_fail(toolset, tool, **args):
     env = call(toolset, tool, **args)
     if env is not None and not env.get("success"):
         log("OK   %s rejected as expected: %s" % (tool, env.get("error")))
-    else:
-        log("FAIL %s should have been rejected" % tool)
+        return env.get("error") or ""
+    log("FAIL %s should have been rejected" % tool)
+    return ""
+
+def check(cond, what, detail=""):
+    log("%s %s%s" % ("OK  " if cond else "FAIL", what, (": %s" % (detail,)) if detail != "" else ""))
+    return cond
+
+def pins_of(node):
+    return {p["name"]: p for p in node.get("pins", [])}
 
 schemas = json.loads(unreal.ToolsetRegistry.get_all_toolset_json_schemas())
 ours = [s for s in schemas if s["name"].startswith("AnimMCPToolset.")]
@@ -285,6 +293,114 @@ rs = unreal.ToolsetRegistry.execute_tool("AnimMCPToolset.AnimInspectToolset", "a
 log("%s qualified tool name: schema=%s qualified_error=%r short_error=%r" % (
     "OK  " if qualified and qualified[0].startswith("AnimMCPToolset.") and "Unknown tool" in (rq.error or "") and not rs.error else "FAIL",
     qualified, rq.error, rs.error))
+
+# --- v0.3 step 1: anim_build_state_machine upgrades (wildcard, bindings, extra nodes, combined conditions, priority, blend settings)
+BP4 = "/Game/AMCPTest/ABP_Spec"
+BS = "/Game/AMCPTest/BS_Test"
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Spec", skeleton_path=SK)
+curve = unreal.AssetToolsHelpers.get_asset_tools().create_asset("CV_Blend", "/Game/AMCPTest", unreal.CurveFloat, unreal.CurveFloatFactory())
+check(curve is not None, "blend curve asset created for the test")
+
+def state_machines(bp):
+    r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=bp, graph="AnimGraph")
+    return [n for n in r["nodes"] if n["class"] == "AnimGraphNode_StateMachine"] if r else []
+
+spec5 = {"name": "Loco", "connect_to_output": True,
+         "variables": [{"name": "Speed", "type": "float"}, {"name": "Rate", "type": "float", "default": "1"}, {"name": "Lean", "type": "float"},
+                       {"name": "bFalling", "type": "bool"}, {"name": "bLadder", "type": "bool"}],
+         "states": [{"name": "Idle", "animation": IDLE},
+                    {"name": "Move", "animation": BS, "bind": {"X": "Speed"}},
+                    {"name": "Walk", "animation": WALK, "bind": {"playrate": "Rate"},
+                     "nodes": [{"class": "AnimGraphNode_Slot", "properties": {"Node.SlotName": "UpperBody"}},
+                               {"class": "AnimGraphNode_ModifyCurve", "properties": {"Node.CurveMap": "((\"Lean\", 1.0))"}, "bind": {"Alpha": "Lean"}}]},
+                    {"name": "Fall", "animation": IDLE}],
+         "transitions": [{"from": "Idle", "to": "Move", "priority": 2, "blend_mode": "Linear",
+                          "rule": {"and": [{"compare": "Speed", "comparison": ">", "threshold": 10}, {"not": {"bool": "bFalling"}}]}},
+                         {"from": "Move", "to": "Walk", "blend_curve": "/Game/AMCPTest/CV_Blend",
+                          "rule": {"or": [{"bool": "bLadder"}, {"compare": "Speed", "comparison": "<", "threshold": 5}, {"bool": "bFalling"}]}},
+                         {"from": "*", "to": "Fall", "rule": "bool_variable", "variable": "bFalling", "priority": 0, "crossfade_duration": 0.1},
+                         {"from": "Idle", "to": "Fall", "rule": "always"}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(spec5))
+if r:
+    tr = {(t["from"], t["to"]): t for t in r["transitions"]}
+    wild = sorted(t["from"] for t in r["transitions"] if t.get("from_wildcard"))
+    check(len(r["transitions"]) == 5 and wild == ["Move", "Walk"] and not tr[("Idle", "Fall")].get("from_wildcard"),
+          "wildcard expands to every other state, explicit Idle->Fall wins", sorted(tr.keys()))
+    check(all(tr[(f, "Fall")]["priority"] == 0 for f in wild) and tr[("Idle", "Fall")]["priority"] == 1 and tr[("Idle", "Fall")]["rule"] == "always",
+          "wildcard transitions carry the spec's priority and rule", [(k, v["priority"], v["rule"]) for k, v in tr.items()])
+    t = tr[("Idle", "Move")]
+    check(t["rule"] == "condition" and t["priority"] == 2 and t["blend_mode"] == "Linear" and len(t["rule_nodes"]) == 5,
+          "and/not/compare condition, priority 2, blend Linear", (t["rule"], t["priority"], t["blend_mode"], len(t["rule_nodes"])))
+    t = tr[("Move", "Walk")]
+    n = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=t["node_guid"])
+    check(n and n.get("blend_mode") == "Custom" and n.get("blend_curve", "").endswith("CV_Blend") and len(t["rule_nodes"]) == 6,
+          "or condition, blend_curve implies Custom", n and (n.get("blend_mode"), n.get("blend_curve"), len(t["rule_nodes"])))
+    n = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=tr[("Walk", "Fall")]["node_guid"])
+    check(n and n["priority_order"] == 0 and abs(n["crossfade_duration"] - 0.1) < 1e-6, "transition node holds priority and crossfade", n and (n["priority_order"], n["crossfade_duration"]))
+    rg = [g for g in ok("AnimInspectToolset", "anim_list_graphs", blueprint_path=BP4)["graphs"] if g.get("owner_node_guid") == tr[("Idle", "Move")]["node_guid"]][0]
+    rn = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph=rg["graph_guid"])
+    calls = [x["title"] for x in rn["nodes"] if x["class"] == "K2Node_CallFunction"] if rn else []
+    check(len(calls) == 3 and any("AND" in x for x in calls) and any("NOT" in x for x in calls) and any(">" in x for x in calls),
+          "rule graph has >, NOT, AND", calls)
+
+    st = {s["name"]: s for s in r["states"]}
+    move = st["Move"]
+    check([(b["pin"], b["variable"]) for b in move.get("bindings", [])] == [("X", "Speed")], "Move binds X to Speed", move.get("bindings"))
+    p = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=move["player_node_guid"])
+    xpin = pins_of(p).get("X", {}) if p else {}
+    check(p and p["class"] == "AnimGraphNode_BlendSpacePlayer" and [l["node_guid"] for l in xpin.get("linked_to", [])] == [move["bindings"][0]["getter_node_guid"]],
+          "blend space X pin is driven by the Speed getter", xpin.get("linked_to"))
+    walk_s = st["Walk"]
+    check([x["class"] for x in walk_s.get("nodes", [])] == ["AnimGraphNode_Slot", "AnimGraphNode_ModifyCurve"], "Walk extra nodes in order", walk_s.get("nodes"))
+    check(sorted((b["pin"], b["variable"]) for b in walk_s.get("bindings", [])) == [("Alpha", "Lean"), ("PlayRate", "Rate")],
+          "PlayRate (hidden by default) and ModifyCurve Alpha are bound", walk_s.get("bindings"))
+    g = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="Walk", include_pins=True)
+    if g:
+        by_class = {x["class"]: x for x in g["nodes"]}
+        slot_guid, mc_guid, player_guid = walk_s["nodes"][0]["node_guid"], walk_s["nodes"][1]["node_guid"], walk_s["player_node_guid"]
+        result_in = [p for p in by_class["AnimGraphNode_StateResult"]["pins"] if p["direction"] == "input"][0]
+        chain_ok = ([l["node_guid"] for l in result_in["linked_to"]] == [mc_guid]
+                    and [l["node_guid"] for l in pins_of(by_class["AnimGraphNode_ModifyCurve"])["SourcePose"]["linked_to"]] == [slot_guid]
+                    and [l["node_guid"] for l in pins_of(by_class["AnimGraphNode_Slot"])["Source"]["linked_to"]] == [player_guid])
+        check(chain_ok, "chain player -> Slot -> ModifyCurve -> Output Pose", sorted(by_class.keys()))
+        check("UpperBody" in by_class["AnimGraphNode_Slot"]["title"], "Slot name set through properties", by_class["AnimGraphNode_Slot"]["title"])
+        rate = pins_of(by_class["AnimGraphNode_SequencePlayer"]).get("PlayRate", {})
+        check(rate and not rate["hidden"] and rate["linked_to"], "PlayRate pin exposed and linked", rate.get("linked_to"))
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP4)
+    c and check(c["num_errors"] == 0, "compile spec with bindings, nodes and conditions", (c["num_errors"], c["num_warnings"], [m["message"][:80] for m in c["messages"]][:4]))
+
+    # anim_set_transition_rule with a combined condition
+    t = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition",
+           condition=json.dumps({"or": [{"bool": "bLadder"}, {"not": {"bool": "bFalling"}}]}))
+    t and check(t["rule"] == "condition" and len(t["rule_nodes"]) == 4, "anim_set_transition_rule condition", (t["rule"], len(t["rule_nodes"])))
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="bool_variable", variable_name="bFalling", condition='{"bool": "bFalling"}')
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition", condition="{nope")
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition")
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition", condition='{"and": [{"bool": "bFalling"}]}')
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP4)
+    c and check(c["num_errors"] == 0, "compile after condition rule", c["num_errors"])
+
+# Atomic: every problem is listed and nothing is created.
+before = len(state_machines(BP4))
+bad5 = {"name": "Bad", "variables": [{"name": "bJump", "type": "bool"}],
+        "states": [{"name": "A", "animation": BS, "bind": {"Z": "Speed", "X": "bJump"}},
+                   {"name": "B", "nodes": [{"class": "NoSuchNode"}, {"class": "AnimGraphNode_Slot", "properties": {"Node.NoProp": "1"}}]},
+                   {"name": "C", "bind": {"X": "Speed"}}],
+        "transitions": [{"from": "A", "to": "B", "blend_mode": "Wobbly"},
+                        {"from": "B", "to": "A", "blend_mode": "Linear", "blend_curve": "/Game/AMCPTest/CV_Blend"},
+                        {"from": "A", "to": "*"},
+                        {"from": "A", "to": "C", "priority": 1.5, "rule": {"bool": "bJump", "not": {"bool": "bJump"}}},
+                        {"from": "B", "to": "C", "rule": {"and": [{"bool": "Missing"}, {"compare": "Speed", "comparison": ">"}]}}]}
+err = expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(bad5))
+want = ["no pin 'Z'", "bind 'X': variable 'bJump'", "NoSuchNode", "NoProp", "needs an 'animation'", "Wobbly", "only used with blend_mode 'Custom'",
+        "only 'from' may be '*'", "priority must be a whole number", "exactly one of", "'Missing'", "'compare' needs"]
+missing = [w for w in want if w not in err]
+check(not missing, "bad spec lists every problem", missing or err.count("\n- "))
+check(len(state_machines(BP4)) == before, "nothing created on bad spec", len(state_machines(BP4)))
+err = expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(
+    {"name": "Wild", "states": [{"name": "A"}, {"name": "B"}], "transitions": [{"from": "A", "to": "B"}, {"from": "*", "to": "B"}]}))
+check("expands to no transitions" in err, "wildcard that expands to nothing is rejected", err[:120])
+check(len(state_machines(BP4)) == before, "still nothing created", len(state_machines(BP4)))
 
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))
