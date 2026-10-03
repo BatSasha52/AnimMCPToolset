@@ -454,5 +454,58 @@ r = ok("AnimStateMachineToolset", "anim_remove_state", blueprint_path=BP4, state
 r and check(len(r["removed_transition_guids"]) == 3 and len(r["disconnected"]) == 6, "remove_state reports the transition links it broke",
             (len(r["removed_transition_guids"]), len(r["disconnected"])))
 
+# --- v0.3 step 3: animation data, read-only
+def close(a, b, eps=1e-3):
+    return all(abs(x - y) <= eps for x, y in zip(a, b)) and len(a) == len(b)
+
+info = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WALK)
+if info:
+    log("walk info: length=%s fps=%s frames=%s keys=%s root_motion=%s curves=%d notifies=%d measured=%s" % (
+        info["length"], info["frame_rate"], info["frame_count"], info["key_count"], info["root_motion"], len(info["curves"]), len(info["notifies"]), info.get("bones_measured")))
+    check(info["length"] > 0 and info["frame_rate"] > 0 and abs(info["frame_count"] - info["length"] * info["frame_rate"]) < 1.01 and info["key_count"] == info["frame_count"] + 1,
+          "length, frame rate and frame count agree", (info["length"], info["frame_rate"], info["frame_count"], info["key_count"]))
+    check(info["class"] == "AnimSequence" and info["bone_track_count"] > 0 and info["skeleton"].endswith("TutorialTPP_Skeleton"), "class, skeleton and bone tracks", (info["class"], info["bone_track_count"]))
+    trav = {t["bone"].lower(): t for t in info.get("travel", [])}
+    check([b.lower() for b in info.get("bones_measured", [])] == ["root", "pelvis"] and set(trav) == {"root", "pelvis"}, "auto travel bones are root and pelvis", info.get("bones_measured"))
+    for bone, t in trav.items():
+        d = t["delta"]
+        consistent = (close([t["end"][i] - t["start"][i] for i in range(3)], [d["x"], d["y"], d["z"]])
+                      and abs(t["distance"] - (d["x"] ** 2 + d["y"] ** 2 + d["z"] ** 2) ** 0.5) < 1e-3
+                      and abs(t["horizontal_distance"] - (d["x"] ** 2 + d["y"] ** 2) ** 0.5) < 1e-3 and t["path_length"] >= t["distance"] - 1e-3)
+        check(consistent, "%s travel is self-consistent" % bone, (d, t["distance"], t["path_length"]))
+    s0 = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, bones="root,pelvis")
+    s1 = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=info["length"], bones="pelvis, root")
+    if s0 and s1:
+        b0 = {b["name"].lower(): b for b in s0["bones"]}
+        b1 = {b["name"].lower(): b for b in s1["bones"]}
+        check(close(b0["pelvis"]["translation"], trav["pelvis"]["start"]) and close(b1["pelvis"]["translation"], trav["pelvis"]["end"]),
+              "sampled pelvis at 0 and at the end matches the travel report", (b0["pelvis"]["translation"], trav["pelvis"]["start"], b1["pelvis"]["translation"], trav["pelvis"]["end"]))
+        check(s0["space"] == "component" and s0["frame"] == 0 and abs(s1["frame"] - info["frame_count"]) < 1e-3 and b0["pelvis"]["parent"].lower() == "root",
+              "sample reports space, frame and parent", (s0["space"], s0["frame"], s1["frame"], b0["pelvis"]["parent"]))
+        q = b0["pelvis"]["quaternion"]
+        check(abs(sum(x * x for x in q) - 1) < 1e-3 and len(b0["pelvis"]["rotation"]) == 3 and len(b0["pelvis"]["scale"]) == 3, "rotation is a unit quaternion plus euler angles", q)
+    mid = info["length"] / 2
+    pc = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="root,pelvis", space="component")
+    pp = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="root,pelvis", space="parent")
+    if pc and pp:
+        c = {b["name"].lower(): b for b in pc["bones"]}
+        p = {b["name"].lower(): b for b in pp["bones"]}
+        check(close(c["root"]["translation"], p["root"]["translation"]) and close(c["root"]["quaternion"], p["root"]["quaternion"]), "root: component space == parent space")
+        if close(c["root"]["translation"], [0, 0, 0]) and close(c["root"]["rotation"], [0, 0, 0]):
+            check(close(c["pelvis"]["translation"], p["pelvis"]["translation"]), "pelvis under an identity root: component == parent space")
+    al = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0)
+    bones_info = ok("AnimInspectToolset", "anim_list_skeleton_bones", asset_path=SK)
+    al and bones_info and check(len(al["bones"]) == len(bones_info["bones"]), "bones='*' samples every skeleton bone", (len(al["bones"]), len(bones_info["bones"])))
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=info["length"] + 1)
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, bones="root,no_such_bone")
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, space="world")
+    expect_fail("AnimDataToolset", "anim_get_animation_info", asset_path=WALK, travel_bones="no_such_bone")
+r = ok("AnimDataToolset", "anim_get_animation_info", asset_path=IDLE, travel_bones="none")
+r and check("travel" not in r, "travel_bones='none' skips travel", sorted(r.keys()))
+r = ok("AnimDataToolset", "anim_get_animation_info", asset_path=IDLE, travel_bones="hand_r")
+r and check(r.get("bones_measured") == ["hand_r"], "explicit travel bone", r.get("bones_measured"))
+expect_fail("AnimDataToolset", "anim_get_animation_info", asset_path=BS)
+expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=BS, time=0)
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

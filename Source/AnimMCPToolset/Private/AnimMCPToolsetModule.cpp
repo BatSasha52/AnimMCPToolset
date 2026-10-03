@@ -4,6 +4,7 @@
 #include "ToolsetRegistry/UToolsetRegistry.h"
 
 #include "AnimAssetToolset.h"
+#include "AnimDataToolset.h"
 #include "AnimGraphEditToolset.h"
 #include "AnimInspectToolset.h"
 #include "AnimStateMachineToolset.h"
@@ -21,6 +22,7 @@ public:
 		UToolsetRegistry::RegisterToolsetClass(UAnimGraphEditToolset::StaticClass());
 		UToolsetRegistry::RegisterToolsetClass(UAnimStateMachineToolset::StaticClass());
 		UToolsetRegistry::RegisterToolsetClass(UAnimAssetToolset::StaticClass());
+		UToolsetRegistry::RegisterToolsetClass(UAnimDataToolset::StaticClass());
 	}
 
 	virtual void ShutdownModule() override
@@ -29,6 +31,7 @@ public:
 		{
 			return;
 		}
+		UToolsetRegistry::UnregisterToolsetClass(UAnimDataToolset::StaticClass());
 		UToolsetRegistry::UnregisterToolsetClass(UAnimAssetToolset::StaticClass());
 		UToolsetRegistry::UnregisterToolsetClass(UAnimStateMachineToolset::StaticClass());
 		UToolsetRegistry::UnregisterToolsetClass(UAnimGraphEditToolset::StaticClass());
