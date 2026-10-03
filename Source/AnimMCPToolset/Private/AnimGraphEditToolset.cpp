@@ -174,12 +174,14 @@ FAnimMCPResult UAnimGraphEditToolset::anim_remove_node(const FString& blueprint_
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveNode", "AnimMCP: Remove Node"));
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 	AnimBP->Modify();
 	AnimMCP::RemoveNode(AnimBP, Node);
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_node_guid"), node_guid);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -256,6 +258,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_connect_pins(const FString& blueprint
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("ConnectPins", "AnimMCP: Connect Pins"));
+	const AnimMCP::FLinkTracker Tracker({ FromNode->GetGraph() });
 	FromNode->Modify();
 	ToNode->Modify();
 	for (UEdGraphPin* Linked : ToPin->LinkedTo)
@@ -274,10 +277,11 @@ FAnimMCPResult UAnimGraphEditToolset::anim_connect_pins(const FString& blueprint
 	}
 	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
 
+	const TArray<TSharedPtr<FJsonValue>> Disconnected = Tracker.Disconnected();
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetBoolField(TEXT("connected"), true);
-	Payload->SetBoolField(TEXT("replaced_existing_links"),
-		Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_A || Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_B || Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_AB);
+	Payload->SetBoolField(TEXT("replaced_existing_links"), !Disconnected.IsEmpty());
+	Payload->SetArrayField(TEXT("disconnected"), Disconnected);
 	Payload->SetStringField(TEXT("message"), Response.Message.ToString());
 	return AnimMCP::Ok(Payload);
 }
@@ -304,7 +308,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 	}
 
 	const UEdGraphSchema* Schema = Node->GetGraph()->GetSchema();
-	int32 LinksBroken = 0;
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 
 	if (AnimMCP::IsUnset(to_node_guid))
 	{
@@ -319,7 +323,6 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 		{
 			Linked->GetOwningNode()->Modify();
 		}
-		LinksBroken = Pin->LinkedTo.Num();
 		Schema->BreakPinLinks(*Pin, /*bSendsNodeNotifcation*/ true);
 	}
 	else
@@ -347,12 +350,13 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 		Node->Modify();
 		OtherNode->Modify();
 		Schema->BreakSinglePinLink(Pin, OtherPin);
-		LinksBroken = 1;
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
+	const TArray<TSharedPtr<FJsonValue>> Disconnected = Tracker.Disconnected();
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetNumberField(TEXT("links_broken"), LinksBroken);
+	Payload->SetNumberField(TEXT("links_broken"), Disconnected.Num());
+	Payload->SetArrayField(TEXT("disconnected"), Disconnected);
 	return AnimMCP::Ok(Payload);
 }
 
@@ -463,6 +467,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_set_node_property(const FString& blue
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetNodeProperty", "AnimMCP: Set Node Property"));
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 	FString ReadBack;
 	if (!AnimMCP::SetNodePropertyByPath(Node, property_path, value, ReadBack, Error))
 	{
@@ -474,6 +479,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_set_node_property(const FString& blue
 	Payload->SetStringField(TEXT("node_guid"), node_guid);
 	Payload->SetStringField(TEXT("property_path"), property_path);
 	Payload->SetStringField(TEXT("value"), ReadBack);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 

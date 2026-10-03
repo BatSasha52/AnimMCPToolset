@@ -543,6 +543,105 @@ namespace AnimMCP
 		return Class;
 	}
 
+	// ---- Link tracking ---------------------------------------------------------------------
+
+	FLinkTracker::FLinkTracker(TArray<const UEdGraph*> InGraphs)
+	{
+		for (const UEdGraph* Graph : InGraphs)
+		{
+			if (Graph && !Graphs.Contains(Graph))
+			{
+				Graphs.Add(Graph);
+			}
+		}
+		Collect(Graphs, Links, Nodes);
+	}
+
+	void FLinkTracker::Collect(const TArray<TWeakObjectPtr<const UEdGraph>>& InGraphs, TArray<FLink>& OutLinks, TArray<FNodeRecord>& OutNodes)
+	{
+		for (const TWeakObjectPtr<const UEdGraph>& Graph : InGraphs)
+		{
+			if (!Graph.IsValid())
+			{
+				continue;
+			}
+			for (const UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (!Node)
+				{
+					continue;
+				}
+				const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+				OutNodes.Add({ Node->NodeGuid, Title, Node->GetClass()->GetName() });
+				// Each link is recorded once, from its output end.
+				for (const UEdGraphPin* Pin : Node->Pins)
+				{
+					if (!Pin || Pin->Direction != EGPD_Output)
+					{
+						continue;
+					}
+					for (const UEdGraphPin* Linked : Pin->LinkedTo)
+					{
+						const UEdGraphNode* Other = Linked ? Linked->GetOwningNodeUnchecked() : nullptr;
+						if (Other)
+						{
+							OutLinks.Add({ Node->NodeGuid, Pin->PinName, Other->NodeGuid, Linked->PinName, Title, Other->GetNodeTitle(ENodeTitleType::ListView).ToString() });
+						}
+					}
+				}
+			}
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> FLinkTracker::Disconnected() const
+	{
+		TArray<FLink> Now;
+		TArray<FNodeRecord> NodesNow;
+		Collect(Graphs, Now, NodesNow);
+
+		TArray<TSharedPtr<FJsonValue>> Result;
+		for (const FLink& Link : Links)
+		{
+			const bool bStillThere = Now.ContainsByPredicate([&Link](const FLink& Other)
+			{
+				return Other.FromNode == Link.FromNode && Other.FromPin == Link.FromPin && Other.ToNode == Link.ToNode && Other.ToPin == Link.ToPin;
+			});
+			if (!bStillThere)
+			{
+				TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+				Json->SetStringField(TEXT("from_node_guid"), GuidToString(Link.FromNode));
+				Json->SetStringField(TEXT("from_node"), Link.FromTitle);
+				Json->SetStringField(TEXT("from_pin"), Link.FromPin.ToString());
+				Json->SetStringField(TEXT("to_node_guid"), GuidToString(Link.ToNode));
+				Json->SetStringField(TEXT("to_node"), Link.ToTitle);
+				Json->SetStringField(TEXT("to_pin"), Link.ToPin.ToString());
+				Result.Add(MakeShared<FJsonValueObject>(Json));
+			}
+		}
+		return Result;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> FLinkTracker::RemovedNodes() const
+	{
+		TArray<FLink> LinksNow;
+		TArray<FNodeRecord> Now;
+		Collect(Graphs, LinksNow, Now);
+
+		TArray<TSharedPtr<FJsonValue>> Result;
+		for (const FNodeRecord& Node : Nodes)
+		{
+			if (!Now.ContainsByPredicate([&Node](const FNodeRecord& Other) { return Other.Guid == Node.Guid; }))
+			{
+				TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+				Json->SetStringField(TEXT("node_guid"), GuidToString(Node.Guid));
+				Json->SetStringField(TEXT("title"), Node.Title);
+				Json->SetStringField(TEXT("class"), Node.Class);
+				Result.Add(MakeShared<FJsonValueObject>(Json));
+			}
+		}
+		return Result;
+	}
+
 	// ---- Properties ------------------------------------------------------------------------
 
 	bool ResolvePropertyPath(UObject* Object, const FString& Path, FResolvedProperty& Out, FString& OutError)

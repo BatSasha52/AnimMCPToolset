@@ -402,5 +402,57 @@ err = expect_fail("AnimStateMachineToolset", "anim_build_state_machine", bluepri
 check("expands to no transitions" in err, "wildcard that expands to nothing is rejected", err[:120])
 check(len(state_machines(BP4)) == before, "still nothing created", len(state_machines(BP4)))
 
+# --- v0.3 step 2: tools that replace or break links report every link they disconnected
+def links(lst):
+    return sorted((l["from_node_guid"], l["from_pin"], l["to_node_guid"], l["to_pin"]) for l in lst)
+
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="AnimGraph", include_pins=True)
+root4 = [n for n in r["nodes"] if n["class"] == "AnimGraphNode_Root"][0]
+loco4 = [n for n in r["nodes"] if n["class"] == "AnimGraphNode_StateMachine"][0]
+old_out = [(l["node_guid"], l["pin_name"]) for p in root4["pins"] if p["direction"] == "input" for l in p["linked_to"]]
+check(old_out and old_out[0][0] == loco4["node_guid"], "Loco drives the Output Pose before the rebuild", old_out)
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps({"name": "Loco2", "connect_to_output": True, "states": [{"name": "Idle", "animation": IDLE}]}))
+r and check(links(r["disconnected"]) == [(loco4["node_guid"], "Pose", root4["node_guid"], "Result")], "connect_to_output reports the replaced Output Pose link", r["disconnected"])
+
+p1 = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_SequencePlayer", x=-600, y=400)
+p2 = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_SequencePlayer", x=-600, y=600)
+bl = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_TwoWayBlend", x=-300, y=500)
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=p1["node_guid"], from_pin="Pose", to_node_guid=bl["node_guid"], to_pin="A")
+r and check(r["disconnected"] == [] and not r["replaced_existing_links"], "first connection disconnects nothing", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=p2["node_guid"], from_pin="Pose", to_node_guid=bl["node_guid"], to_pin="A")
+r and check(r["replaced_existing_links"] and links(r["disconnected"]) == [(p1["node_guid"], "Pose", bl["node_guid"], "A")],
+            "replacing a pose link names the old link", r["disconnected"])
+sm2 = state_machines(BP4)
+loco2 = [n for n in sm2 if n["state_machine_graph"] == "Loco2"][0]["node_guid"]
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=bl["node_guid"], from_pin="Pose", to_node_guid=root4["node_guid"], to_pin="Result")
+r and check(links(r["disconnected"]) == [(loco2, "Pose", root4["node_guid"], "Result")] and r["disconnected"][0]["to_node"],
+            "Output Pose link replaced by connect_pins is reported", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_disconnect_pins", blueprint_path=BP4, node_guid=bl["node_guid"], pin="A")
+r and check(r["links_broken"] == 1 and links(r["disconnected"]) == [(p2["node_guid"], "Pose", bl["node_guid"], "A")], "disconnect_pins lists the broken link", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_set_node_property", blueprint_path=BP4, node_guid=bl["node_guid"], property_path="Node.bAlwaysUpdateChildren", value="true")
+r and check(r["disconnected"] == [], "property change that keeps pins disconnects nothing", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_remove_node", blueprint_path=BP4, node_guid=bl["node_guid"])
+r and check(links(r["disconnected"]) == [(bl["node_guid"], "Pose", root4["node_guid"], "Result")], "remove_node lists the links it broke", r["disconnected"])
+
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="Loco")
+loco_nodes = {n.get("state_name") or n.get("title"): n for n in r["nodes"]} if r else {}
+entry = [n for n in r["nodes"] if n["class"] == "AnimStateEntryNode"][0]["node_guid"]
+r = ok("AnimStateMachineToolset", "anim_add_state", blueprint_path=BP4, state_machine_guid=loco4["node_guid"], name="Start", x=0, y=600, set_as_entry=True)
+r and check(len(r["disconnected"]) == 1 and r["disconnected"][0]["from_node_guid"] == entry and r["disconnected"][0]["to_node_guid"] == loco_nodes["Idle"]["node_guid"],
+            "set_as_entry reports the previous Entry link", r["disconnected"])
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP4, state_guid=loco_nodes["Move"]["node_guid"], asset_path=WALK)
+if r:
+    removed = [n["class"] for n in r["removed_nodes"]]
+    gone = [(l["from_node"], l["from_pin"], l["to_pin"]) for l in r["disconnected"]]
+    check(removed == ["AnimGraphNode_BlendSpacePlayer"] and len(r["disconnected"]) == 2 and any(p == "X" for _, _, p in gone),
+          "set_state_animation reports the replaced player and the binding it orphaned", (removed, gone))
+fall_t = [n for n in loco_nodes.values() if n.get("from_state") == "Idle" and n.get("to_state") == "Fall"][0]["node_guid"]
+r = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=fall_t, rule="always")
+r and check(len(r["removed_nodes"]) == 4 and len(r["disconnected"]) == 4, "set_transition_rule reports the old rule's nodes and links",
+            ([n["title"] for n in r["removed_nodes"]], len(r["disconnected"])))
+r = ok("AnimStateMachineToolset", "anim_remove_state", blueprint_path=BP4, state_guid=loco_nodes["Fall"]["node_guid"])
+r and check(len(r["removed_transition_guids"]) == 3 and len(r["disconnected"]) == 6, "remove_state reports the transition links it broke",
+            (len(r["removed_transition_guids"]), len(r["disconnected"])))
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))

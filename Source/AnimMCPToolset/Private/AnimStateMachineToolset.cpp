@@ -1105,6 +1105,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_add_state(const FString& blueprint
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("AddState", "AnimMCP: Add State"));
+	const AnimMCP::FLinkTracker Tracker({ SMGraph });
 	AnimBP->Modify();
 	UAnimStateNode* State = CastChecked<UAnimStateNode>(SpawnNamedStateNode(SMGraph, UAnimStateNode::StaticClass(), name, FVector2D(x, y)));
 
@@ -1122,6 +1123,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_add_state(const FString& blueprint
 
 	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(State, /*bIncludePins*/ false);
 	Payload->SetBoolField(TEXT("is_entry"), set_as_entry);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -1146,6 +1148,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_state(const FString& bluepr
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveState", "AnimMCP: Remove State"));
+	const AnimMCP::FLinkTracker Tracker({ State->GetGraph() });
 	AnimBP->Modify();
 
 	TArray<TSharedPtr<FJsonValue>> RemovedTransitions;
@@ -1160,6 +1163,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_state(const FString& bluepr
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_state_guid"), state_guid);
 	Payload->SetArrayField(TEXT("removed_transition_guids"), RemovedTransitions);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -1229,12 +1233,14 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_transition(const FString& b
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveTransition", "AnimMCP: Remove Transition"));
+	const AnimMCP::FLinkTracker Tracker({ Transition->GetGraph() });
 	AnimBP->Modify();
 	AnimMCP::RemoveNode(AnimBP, Transition);
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_transition_guid"), transition_guid);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -1295,6 +1301,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetTransitionRule", "AnimMCP: Set Transition Rule"));
+	const AnimMCP::FLinkTracker Tracker({ Owner->GetBoundGraph() });
 	AnimBP->Modify();
 	if (Transition && crossfade_duration >= 0.f)
 	{
@@ -1322,6 +1329,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(Owner, /*bIncludePins*/ false);
 	Payload->SetStringField(TEXT("rule"), RuleKindToString(Resolved.Kind));
 	Payload->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+	Payload->SetArrayField(TEXT("removed_nodes"), Tracker.RemovedNodes());
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	Payload->SetArrayField(TEXT("warnings"), AnimMCP::ToJsonArray(Warnings));
 	return AnimMCP::Ok(Payload);
 }
@@ -1358,6 +1367,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetStateAnimation", "AnimMCP: Set State Animation"));
+	const AnimMCP::FLinkTracker Tracker({ State->BoundGraph });
 	AnimBP->Modify();
 	UAnimGraphNode_Base* PoseNode = nullptr;
 	UAnimGraphNode_Base* Player = nullptr;
@@ -1376,6 +1386,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	{
 		Payload->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
 	}
+	Payload->SetArrayField(TEXT("removed_nodes"), Tracker.RemovedNodes());
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -2551,7 +2563,9 @@ FAnimMCPResult UAnimStateMachineToolset::anim_build_state_machine(const FString&
 	bool bApplied = false;
 	{
 		const FScopedTransaction Transaction(LOCTEXT("BuildStateMachine", "AnimMCP: Build State Machine"));
+		const AnimMCP::FLinkTracker Tracker({ Spec.Graph });
 		bApplied = ApplyStateMachineSpec(AnimBP, Spec, Payload, Error);
+		Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 	}
 	if (!bApplied)

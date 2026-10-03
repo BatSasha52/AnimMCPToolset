@@ -132,6 +132,44 @@ namespace AnimMCP
 	 */
 	UClass* ResolveNodeClass(const FString& Name, FString& OutError);
 
+	/**
+	 * Records every link (and node) in some graphs before an edit, so the tool can report exactly what the edit
+	 * disconnected or removed. Links are identified by node GUID and pin name on both ends.
+	 */
+	class FLinkTracker
+	{
+	public:
+		explicit FLinkTracker(TArray<const UEdGraph*> InGraphs);
+
+		/** Links that existed when the tracker was created and are gone now: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]. */
+		TArray<TSharedPtr<FJsonValue>> Disconnected() const;
+
+		/** Nodes that existed when the tracker was created and are gone now: [{node_guid, title, class}]. */
+		TArray<TSharedPtr<FJsonValue>> RemovedNodes() const;
+
+	private:
+		struct FLink
+		{
+			FGuid FromNode;
+			FName FromPin;
+			FGuid ToNode;
+			FName ToPin;
+			FString FromTitle;
+			FString ToTitle;
+		};
+		struct FNodeRecord
+		{
+			FGuid Guid;
+			FString Title;
+			FString Class;
+		};
+		static void Collect(const TArray<TWeakObjectPtr<const UEdGraph>>& Graphs, TArray<FLink>& OutLinks, TArray<FNodeRecord>& OutNodes);
+
+		TArray<TWeakObjectPtr<const UEdGraph>> Graphs;
+		TArray<FLink> Links;
+		TArray<FNodeRecord> Nodes;
+	};
+
 	// ---- Properties ------------------------------------------------------------------------
 
 	struct FResolvedProperty
