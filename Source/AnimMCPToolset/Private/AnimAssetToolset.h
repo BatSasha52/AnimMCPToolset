@@ -129,4 +129,31 @@ public:
 	 */
 	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
 	static FAnimMCPResult anim_set_skeleton_compatible(const FString& skeleton_path, const FString& compatible_skeleton_path, bool compatible = true);
+
+	/**
+	 * Renames (or moves) an Animation Blueprint, then compiles it and reports what broke.
+	 * The rename happens in memory: nothing is saved and nothing is deleted. A redirector is left at the old path so references from
+	 * other assets keep working; save both the new path and the old path (the redirector) with anim_save_asset to make the rename permanent.
+	 * A rename cannot be undone with Ctrl+Z (the editor does not record renames); rename it back instead.
+	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
+	 * @param new_name New asset name, e.g. 'ABP_Hero_Main'. Must not be taken.
+	 * @param new_folder Destination folder under /Game. 'auto' = keep the current folder.
+	 * @return Result: {old_path, new_path, redirector, referencers: [packages that reference the old path, from the asset registry, i.e. saved assets], save_to_finish: [paths],
+	 *         compile: {status, num_errors, num_warnings, messages}, saved: false}.
+	 */
+	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
+	static FAnimMCPResult anim_rename_anim_blueprint(const FString& blueprint_path, const FString& new_name, const FString& new_folder = TEXT("auto"));
+
+	/**
+	 * Changes the parent class of an Animation Blueprint the way the editor's Reparent Blueprint does, compiles it, and reports what broke:
+	 * compile messages that are new since the change (e.g. variables or functions the old parent provided) and messages the change fixed.
+	 * Undoable as one transaction (the compile itself is not undone; compile again after Ctrl+Z).
+	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
+	 * @param new_parent An AnimInstance class name ('AnimInstance'), class path ('/Script/MyGame.MyAnimInstance') or Animation Blueprint path.
+	 *        It must not be this blueprint or one of its children, and a parent Animation Blueprint must use a compatible skeleton.
+	 * @return Result: {path, old_parent, new_parent, compile: {status, num_errors, num_warnings, messages}, new_errors, new_warnings, fixed, broke}.
+	 *         broke is true when the blueprint compiled without errors before and has errors now.
+	 */
+	UFUNCTION(Category = "AnimMCP|Assets", meta = (AICallable))
+	static FAnimMCPResult anim_reparent_anim_blueprint(const FString& blueprint_path, const FString& new_parent);
 };

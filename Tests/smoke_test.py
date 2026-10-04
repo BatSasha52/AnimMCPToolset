@@ -687,6 +687,74 @@ if TRANSACTIONS:
 else:
     skip("undo of curve, notify and bone key edits")
 
+# --- v0.3 step 5: rename and reparent Animation Blueprints
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Ren", skeleton_path=SK)
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_RenChild", skeleton_path=SK, parent_class="/Game/AMCPTest/ABP_Ren")
+ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Ren")
+ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_RenChild")
+# Referencers come from the asset registry. The editor's file watcher would pick up the saved files; headless, rescan them.
+unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous(["/Game/AMCPTest"], True)
+r = ok("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Ren", new_name="ABP_Renamed")
+if r:
+    check(r["new_path"] == "/Game/AMCPTest/ABP_Renamed.ABP_Renamed" and r["redirector"] == "/Game/AMCPTest/ABP_Ren.ABP_Ren" and r["compile"]["num_errors"] == 0 and not r["saved"],
+          "rename moves the blueprint, leaves a redirector and compiles", (r["new_path"], r["compile"]["status"]))
+    check("/Game/AMCPTest/ABP_RenChild" in r["referencers"], "rename lists the blueprints that reference it", r["referencers"])
+    check(r["save_to_finish"] == ["/Game/AMCPTest/ABP_Renamed", "/Game/AMCPTest/ABP_Ren"], "rename says what to save", r["save_to_finish"])
+    check(not on_disk("/Game/AMCPTest/ABP_Renamed") and on_disk("/Game/AMCPTest/ABP_Ren"), "nothing saved, old file not deleted")
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_RenChild")
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_RenChild")
+    c and i and check(c["num_errors"] == 0 and "ABP_Renamed" in i["parent_class"], "child of the renamed blueprint still compiles and follows it", (c["num_errors"], i["parent_class"]))
+    ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Renamed")
+    ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Ren")
+    check(on_disk("/Game/AMCPTest/ABP_Renamed") and on_disk("/Game/AMCPTest/ABP_Ren"), "saving the new path and the redirector finishes the rename")
+r = ok("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Renamed", new_name="ABP_Moved", new_folder="/Game/AMCPTest/Sub/")
+r and check(r["new_path"] == "/Game/AMCPTest/Sub/ABP_Moved.ABP_Moved", "rename into another folder", r["new_path"])
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="ABP_Test", new_folder="/Game/AMCPTest")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="ABP_X", new_folder="/Engine/X")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="Bad Name!")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Engine/Tutorial/SubEditors/TutorialAssets/Character/TutorialTPP_AnimBlueprint", new_name="X")
+
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Base", skeleton_path=SK)
+ok("AnimAssetToolset", "anim_add_variable", blueprint_path="/Game/AMCPTest/ABP_Base", name="BaseSpeed", type="float")
+ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base")
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Kid", skeleton_path=SK, parent_class="/Game/AMCPTest/ABP_Base")
+g = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph", node_class="K2Node_VariableGet", variable_name="BaseSpeed")
+gs = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph", node_class="K2Node_CallFunction", function_name="KismetSystemLibrary.PrintString", x=300)
+ev = [n for n in ok("AnimInspectToolset", "anim_list_nodes", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph")["nodes"] if n["class"] == "K2Node_Event"]
+log("kid event graph: events=%s" % [(n["title"], n["node_guid"]) for n in ev])
+if g and gs and ev:
+    ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path="/Game/AMCPTest/ABP_Kid", from_node_guid=ev[0]["node_guid"], from_pin="then", to_node_guid=gs["node_guid"], to_pin="execute")
+    ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path="/Game/AMCPTest/ABP_Kid", from_node_guid=g["node_guid"], from_pin="BaseSpeed", to_node_guid=gs["node_guid"], to_pin="InString")
+c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid")
+c and check(c["num_errors"] == 0, "child reading an inherited variable compiles", (c["num_errors"], [m["message"][:80] for m in c["messages"]]))
+r = ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="AnimInstance")
+if r:
+    log("reparent report: new_errors=%s fixed=%s" % ([(m["message"][:90], (m.get("source") or {}).get("node_guid")) for m in r["new_errors"]], len(r["fixed"])))
+    check(r["broke"] and r["new_errors"] and r["new_parent"].endswith("AnimInstance") and "ABP_Base" in r["old_parent"], "reparent reports what broke", (r["broke"], len(r["new_errors"])))
+    check(any("Base Speed" in m["message"] or "BaseSpeed" in m["message"] for m in r["new_errors"]) and any((m.get("source") or {}).get("node_guid") == g["node_guid"] for m in r["new_errors"]),
+          "the new error names the variable and points at the getter node", [m["message"][:90] for m in r["new_errors"]])
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_Kid")
+    i and check(i["parent_class"].endswith("AnimInstance"), "parent class changed", i["parent_class"])
+r = ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_Base")
+r and check(not r["broke"] and r["compile"]["num_errors"] == 0 and len(r["fixed"]) >= 1 and r["new_errors"] == [], "reparenting back fixes it and says so", (r["compile"]["num_errors"], len(r["fixed"])))
+if TRANSACTIONS:
+    ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="AnimInstance")
+    undo()
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_Kid")
+    i and check("ABP_Base" in i["parent_class"], "undo restores the parent", i["parent_class"])
+else:
+    skip("undo of reparent")
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_Base")
+# Regression: right after the undo above, ABP_Kid's compiled class still derives from AnimInstance; the cycle must still be caught.
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base", new_parent="/Game/AMCPTest/ABP_Kid")
+c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid")
+c and check(c["num_errors"] == 0, "child compiles after the reparent round trip", c["num_errors"])
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base", new_parent="/Game/AMCPTest/ABP_Base")
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="Actor")
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_OtherSkel", skeleton_path=SK_COPY)
+err = expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_OtherSkel")
+check("not compatible" in err, "parent with an incompatible skeleton is rejected", err[:100])
+
 fails = [l for l in LOG if l.startswith("FAIL")]
 log("SUMMARY: %d checks, %d failures, %d skipped (%s)" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails),
     len([l for l in LOG if l.startswith("SKIP")]), "full editor" if TRANSACTIONS else "commandlet"))
