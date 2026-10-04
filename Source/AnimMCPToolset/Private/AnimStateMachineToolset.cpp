@@ -23,9 +23,13 @@
 #include "AnimStateEntryNode.h"
 #include "AnimStateNode.h"
 #include "AnimStateTransitionNode.h"
+#include "AlphaBlend.h"
+#include "AnimationGraphSchema.h"
 #include "AnimationStateGraph.h"
+#include "AnimationStateGraphSchema.h"
 #include "AnimationStateMachineGraph.h"
 #include "AnimationTransitionGraph.h"
+#include "Curves/CurveFloat.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraphSchema.h"
 #include "EdGraphSchema_K2.h"
@@ -118,7 +122,7 @@ namespace
 
 	// ---- Transition rules ------------------------------------------------------------------
 
-	enum class ERuleKind : uint8 { Bool, NotBool, Compare, TimeRemaining, Always, Never };
+	enum class ERuleKind : uint8 { Bool, NotBool, Compare, TimeRemaining, Always, Never, Condition };
 
 	/** What a member variable can be used for in a rule. */
 	enum class EVariableKind : uint8 { Missing, Bool, Real, Int, Int64, Byte, Other };
@@ -131,6 +135,18 @@ namespace
 		FString Comparison = TEXT(">");
 		double Threshold = 0.0;
 		float TriggerTime = -1.f;
+		TSharedPtr<FJsonValue> Condition;  // for rule 'condition'
+	};
+
+	/** One term of a rule: a bool variable, a comparison, or not / and / or over other terms. */
+	struct FConditionTerm
+	{
+		enum class EOp : uint8 { Bool, Compare, Not, And, Or };
+		EOp Op = EOp::Bool;
+		FName Variable;
+		UFunction* Function = nullptr;  // the comparison function for Compare
+		FString ThresholdText;
+		TArray<FConditionTerm> Children;
 	};
 
 	/** A rule that has been validated and can be applied without further checks. */
@@ -138,10 +154,14 @@ namespace
 	{
 		ERuleKind Kind = ERuleKind::Never;
 		FName Variable;
-		UFunction* Function = nullptr;  // Not_PreBool or the comparison function
+		UFunction* Function = nullptr;  // the comparison function for Compare
 		FString ThresholdText;
 		float TriggerTime = -1.f;
+		TArray<FConditionTerm> Condition;  // exactly one root term when Kind is Condition
 	};
+
+	/** Nesting limit for combined conditions, so a runaway spec cannot build an enormous rule graph. */
+	constexpr int32 MaxConditionDepth = 8;
 
 	/** Variables declared by a caller but not added to the blueprint yet (anim_build_state_machine). */
 	using FPendingVariables = TMap<FName, FEdGraphPinType>;
@@ -221,6 +241,28 @@ namespace
 		return EVariableKind::Other;
 	}
 
+	/** The pin type of a member variable: pending declarations, then the blueprint's own variables, then inherited properties. */
+	bool GetVariablePinType(UBlueprint* Blueprint, const FName Name, const FPendingVariables* Pending, FEdGraphPinType& OutType)
+	{
+		if (Pending)
+		{
+			if (const FEdGraphPinType* Type = Pending->Find(Name))
+			{
+				OutType = *Type;
+				return true;
+			}
+		}
+		const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, Name);
+		if (VarIndex != INDEX_NONE)
+		{
+			OutType = Blueprint->NewVariables[VarIndex].VarType;
+			return true;
+		}
+		UClass* SearchClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass.Get() : Blueprint->GeneratedClass.Get();
+		const FProperty* Property = SearchClass ? FindFProperty<FProperty>(SearchClass, Name) : nullptr;
+		return Property && GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, OutType);
+	}
+
 	/** Maps '>', '>=' ... to the KismetMathLibrary function prefix. */
 	bool ParseComparison(const FString& Text, FString& OutPrefix)
 	{
@@ -242,6 +284,8 @@ namespace
 		return false;
 	}
 
+	bool ParseCondition(UBlueprint* Blueprint, const TSharedPtr<FJsonValue>& Value, const FString& Where, const FPendingVariables* Pending, int32 Depth, FConditionTerm& Out, TArray<FString>& Problems);
+
 	bool ResolveRule(UBlueprint* Blueprint, const FRuleRequest& Request, FResolvedRule& Out, FString& OutError, const FPendingVariables* Pending = nullptr)
 	{
 		const FString Rule = Request.Rule.TrimStartAndEnd().ToLower();
@@ -251,24 +295,37 @@ namespace
 		else if (Rule == TEXT("time_remaining"))       { Out.Kind = ERuleKind::TimeRemaining; }
 		else if (Rule == TEXT("always"))               { Out.Kind = ERuleKind::Always; }
 		else if (Rule == TEXT("never"))                { Out.Kind = ERuleKind::Never; }
+		else if (Rule == TEXT("condition"))            { Out.Kind = ERuleKind::Condition; }
 		else
 		{
-			OutError = FString::Printf(TEXT("Unknown rule '%s'. Use bool_variable, not_bool_variable, compare, time_remaining, always or never."), *Request.Rule);
+			OutError = FString::Printf(TEXT("Unknown rule '%s'. Use bool_variable, not_bool_variable, compare, condition, time_remaining, always or never."), *Request.Rule);
 			return false;
 		}
 		Out.TriggerTime = Request.TriggerTime;
 
-		if (Out.Kind == ERuleKind::Bool || Out.Kind == ERuleKind::NotBool)
+		if (Out.Kind == ERuleKind::Condition)
+		{
+			if (!Request.Condition.IsValid() || Request.Condition->IsNull())
+			{
+				OutError = TEXT("Rule 'condition' needs a condition, e.g. {\"and\": [{\"bool\": \"bIsMoving\"}, {\"compare\": \"Speed\", \"comparison\": \">\", \"threshold\": 10}]}.");
+				return false;
+			}
+			TArray<FString> Problems;
+			FConditionTerm Root;
+			if (!ParseCondition(Blueprint, Request.Condition, TEXT("condition"), Pending, 0, Root, Problems))
+			{
+				OutError = FString::Join(Problems, TEXT(" "));
+				return false;
+			}
+			Out.Condition = { MoveTemp(Root) };
+		}
+		else if (Out.Kind == ERuleKind::Bool || Out.Kind == ERuleKind::NotBool)
 		{
 			Out.Variable = FName(*Request.VariableName.TrimStartAndEnd());
 			if (AnimMCP::IsUnset(Request.VariableName) || GetVariableKind(Blueprint, Out.Variable, Pending) != EVariableKind::Bool)
 			{
 				OutError = FString::Printf(TEXT("Rule '%s' needs variable_name set to a bool member variable (got '%s'). Use anim_list_variables or anim_add_variable."), *Request.Rule, *Request.VariableName);
 				return false;
-			}
-			if (Out.Kind == ERuleKind::NotBool)
-			{
-				Out.Function = UKismetMathLibrary::StaticClass()->FindFunctionByName(GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool));
 			}
 		}
 		else if (Out.Kind == ERuleKind::Compare)
@@ -327,6 +384,246 @@ namespace
 			}
 		}
 		return true;
+	}
+
+	/** Case-insensitive field lookup, so 'And' and 'and' are the same key. */
+	TSharedPtr<FJsonValue> FindField(const TSharedPtr<FJsonObject>& Object, const FString& Key)
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values)
+		{
+			if (Field.Key.Equals(Key, ESearchCase::IgnoreCase))
+			{
+				return Field.Value;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Parses a combined condition: {"bool": Var}, {"compare": Var, "comparison": ">", "threshold": 10},
+	 * {"not": Cond}, {"and": [Cond, Cond, ...]} or {"or": [...]}. Records every problem found.
+	 */
+	bool ParseCondition(UBlueprint* Blueprint, const TSharedPtr<FJsonValue>& Value, const FString& Where, const FPendingVariables* Pending, int32 Depth, FConditionTerm& Out, TArray<FString>& Problems)
+	{
+		const TSharedPtr<FJsonObject>* ObjectPtr = nullptr;
+		if (!Value.IsValid() || !Value->TryGetObject(ObjectPtr) || !ObjectPtr || !ObjectPtr->IsValid())
+		{
+			Problems.Add(FString::Printf(TEXT("%s: a condition must be an object: {\"bool\": \"bIsMoving\"}, {\"compare\": \"Speed\", \"comparison\": \">\", \"threshold\": 10}, {\"not\": {...}}, {\"and\": [...]} or {\"or\": [...]}."), *Where));
+			return false;
+		}
+		if (Depth > MaxConditionDepth)
+		{
+			Problems.Add(FString::Printf(TEXT("%s: conditions may be nested at most %d levels deep."), *Where, MaxConditionDepth));
+			return false;
+		}
+		const TSharedPtr<FJsonObject>& Object = *ObjectPtr;
+
+		static const TCHAR* const Operators[] = { TEXT("bool"), TEXT("compare"), TEXT("not"), TEXT("and"), TEXT("or") };
+		TArray<FString> Found;
+		for (const TCHAR* Operator : Operators)
+		{
+			if (FindField(Object, Operator).IsValid())
+			{
+				Found.Add(Operator);
+			}
+		}
+		if (Found.Num() != 1)
+		{
+			Problems.Add(FString::Printf(TEXT("%s: a condition needs exactly one of 'bool', 'compare', 'not', 'and', 'or' (found %s)."),
+				*Where, Found.IsEmpty() ? TEXT("none") : *FString::Join(Found, TEXT(", "))));
+			return false;
+		}
+		const FString Operator = Found[0];
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values)
+		{
+			const bool bAllowed = Field.Key.Equals(Operator, ESearchCase::IgnoreCase)
+				|| (Operator == TEXT("compare") && (Field.Key.Equals(TEXT("comparison"), ESearchCase::IgnoreCase) || Field.Key.Equals(TEXT("threshold"), ESearchCase::IgnoreCase)));
+			if (!bAllowed)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: unknown field '%s' in a '%s' condition."), *Where, *Field.Key, *Operator));
+				return false;
+			}
+		}
+		const TSharedPtr<FJsonValue> Operand = FindField(Object, Operator);
+
+		if (Operator == TEXT("bool") || Operator == TEXT("compare"))
+		{
+			FRuleRequest Leaf;
+			if (Operand->Type != EJson::String)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: '%s' must be a variable name."), *Where, *Operator));
+				return false;
+			}
+			Leaf.Rule = Operator == TEXT("bool") ? TEXT("bool_variable") : TEXT("compare");
+			Leaf.VariableName = Operand->AsString();
+			if (Operator == TEXT("compare"))
+			{
+				const TSharedPtr<FJsonValue> Comparison = FindField(Object, TEXT("comparison"));
+				const TSharedPtr<FJsonValue> Threshold = FindField(Object, TEXT("threshold"));
+				if (!Comparison.IsValid() || Comparison->Type != EJson::String || !Threshold.IsValid() || Threshold->Type != EJson::Number)
+				{
+					Problems.Add(FString::Printf(TEXT("%s: 'compare' needs 'comparison' (one of >, >=, <, <=, ==, !=) and a numeric 'threshold'."), *Where));
+					return false;
+				}
+				Leaf.Comparison = Comparison->AsString();
+				Leaf.Threshold = Threshold->AsNumber();
+			}
+			FResolvedRule Resolved;
+			FString Error;
+			if (!ResolveRule(Blueprint, Leaf, Resolved, Error, Pending))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: %s"), *Where, *Error));
+				return false;
+			}
+			Out.Op = Operator == TEXT("bool") ? FConditionTerm::EOp::Bool : FConditionTerm::EOp::Compare;
+			Out.Variable = Resolved.Variable;
+			Out.Function = Resolved.Function;
+			Out.ThresholdText = Resolved.ThresholdText;
+			return true;
+		}
+
+		if (Operator == TEXT("not"))
+		{
+			Out.Op = FConditionTerm::EOp::Not;
+			FConditionTerm& Child = Out.Children.AddDefaulted_GetRef();
+			return ParseCondition(Blueprint, Operand, Where + TEXT(".not"), Pending, Depth + 1, Child, Problems);
+		}
+
+		Out.Op = Operator == TEXT("and") ? FConditionTerm::EOp::And : FConditionTerm::EOp::Or;
+		const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+		if (!Operand->TryGetArray(Items) || Items->Num() < 2)
+		{
+			Problems.Add(FString::Printf(TEXT("%s: '%s' needs an array of at least two conditions."), *Where, *Operator));
+			return false;
+		}
+		bool bOk = true;
+		for (int32 Index = 0; Index < Items->Num(); ++Index)
+		{
+			FConditionTerm& Child = Out.Children.AddDefaulted_GetRef();
+			bOk &= ParseCondition(Blueprint, (*Items)[Index], FString::Printf(TEXT("%s.%s[%d]"), *Where, *Operator, Index), Pending, Depth + 1, Child, Problems);
+		}
+		return bOk;
+	}
+
+	/** The single-variable rules expressed as condition terms, so every rule is built by BuildCondition. */
+	FConditionTerm MakeTerm(const FResolvedRule& Rule)
+	{
+		FConditionTerm Term;
+		Term.Variable = Rule.Variable;
+		if (Rule.Kind == ERuleKind::Compare)
+		{
+			Term.Op = FConditionTerm::EOp::Compare;
+			Term.Function = Rule.Function;
+			Term.ThresholdText = Rule.ThresholdText;
+		}
+		else if (Rule.Kind == ERuleKind::NotBool)
+		{
+			FConditionTerm Inner = Term;
+			Term.Op = FConditionTerm::EOp::Not;
+			Term.Children.Add(MoveTemp(Inner));
+		}
+		return Term;
+	}
+
+	/**
+	 * Creates the nodes for a condition term in a rule graph and returns its bool output pin. Nested terms are placed
+	 * further left; Row advances once per variable so leaves do not overlap. The caller owns the transaction.
+	 */
+	UEdGraphPin* BuildCondition(UEdGraph* RuleGraph, const FConditionTerm& Term, const FVector2D& ResultPos, int32 Depth, int32& Row, TArray<UEdGraphNode*>& OutNodes, FString& OutError)
+	{
+		const UEdGraphSchema* Schema = RuleGraph->GetSchema();
+		const double X = ResultPos.X - 250.0 * (Depth + 1);
+
+		auto SpawnCall = [&](UFunction* Function, const FVector2D& Position) -> UEdGraphNode*
+		{
+			UEdGraphNode* Node = AnimMCP::SpawnNode(RuleGraph, UK2Node_CallFunction::StaticClass(), Position, [Function](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_CallFunction>(NewNode)->SetFromFunction(Function);
+			});
+			OutNodes.Add(Node);
+			return Node;
+		};
+		auto Connect = [&](UEdGraphPin* From, UEdGraphNode* Node, const TCHAR* PinName) -> bool
+		{
+			UEdGraphPin* To = AnimMCP::FindPin(Node, PinName, TEXT("input"), OutError);
+			if (!From || !To || !Schema->TryCreateConnection(From, To))
+			{
+				OutError = FString::Printf(TEXT("Failed to wire input %s of %s in the rule graph."), PinName, *Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+				return false;
+			}
+			return true;
+		};
+
+		if (Term.Op == FConditionTerm::EOp::Bool || Term.Op == FConditionTerm::EOp::Compare)
+		{
+			const FVector2D Position(X, ResultPos.Y + 120.0 * Row++);
+			const bool bCompare = Term.Op == FConditionTerm::EOp::Compare;
+			UEdGraphNode* VarNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_VariableGet::StaticClass(), bCompare ? Position - FVector2D(250.0, 0.0) : Position, [&Term](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_VariableGet>(NewNode)->VariableReference.SetSelfMember(Term.Variable);
+			});
+			OutNodes.Add(VarNode);
+			UEdGraphPin* VarPin = AnimMCP::FindPin(VarNode, Term.Variable.ToString(), TEXT("output"), OutError);
+			if (!VarPin)
+			{
+				OutError = FString::Printf(TEXT("Variable getter for '%s' has no output pin. Compile the blueprint once after adding the variable. %s"), *Term.Variable.ToString(), *OutError);
+				return nullptr;
+			}
+			if (!bCompare)
+			{
+				return VarPin;
+			}
+			UEdGraphNode* Compare = SpawnCall(Term.Function, Position);
+			UEdGraphPin* InB = AnimMCP::FindPin(Compare, TEXT("B"), TEXT("input"), OutError);
+			if (!Connect(VarPin, Compare, TEXT("A")) || !InB)
+			{
+				return nullptr;
+			}
+			Schema->TrySetDefaultValue(*InB, Term.ThresholdText);
+			return AnimMCP::FindPin(Compare, TEXT("ReturnValue"), TEXT("output"), OutError);
+		}
+
+		const int32 FirstRow = Row;
+		TArray<UEdGraphPin*> Inputs;
+		for (const FConditionTerm& Child : Term.Children)
+		{
+			UEdGraphPin* ChildPin = BuildCondition(RuleGraph, Child, ResultPos, Depth + 1, Row, OutNodes, OutError);
+			if (!ChildPin)
+			{
+				return nullptr;
+			}
+			Inputs.Add(ChildPin);
+		}
+
+		FName FunctionName = GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, Not_PreBool);
+		if (Term.Op == FConditionTerm::EOp::And)
+		{
+			FunctionName = GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanAND);
+		}
+		else if (Term.Op == FConditionTerm::EOp::Or)
+		{
+			FunctionName = GET_FUNCTION_NAME_CHECKED(UKismetMathLibrary, BooleanOR);
+		}
+		UFunction* Function = UKismetMathLibrary::StaticClass()->FindFunctionByName(FunctionName);
+		if (!Function || Inputs.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("KismetMathLibrary.%s was not found in this engine version."), *FunctionName.ToString());
+			return nullptr;
+		}
+
+		// NOT takes one input; AND / OR are chained pairwise: ((a AND b) AND c) ...
+		UEdGraphPin* Result = Inputs[0];
+		const int32 Steps = Term.Op == FConditionTerm::EOp::Not ? 1 : Inputs.Num() - 1;
+		for (int32 Step = 0; Step < Steps; ++Step)
+		{
+			UEdGraphNode* Node = SpawnCall(Function, FVector2D(X, ResultPos.Y + 120.0 * (FirstRow + Step)));
+			if (!Connect(Result, Node, TEXT("A")) || (Term.Op != FConditionTerm::EOp::Not && !Connect(Inputs[Step + 1], Node, TEXT("B"))))
+			{
+				return nullptr;
+			}
+			Result = AnimMCP::FindPin(Node, TEXT("ReturnValue"), TEXT("output"), OutError);
+		}
+		return Result;
 	}
 
 	/**
@@ -397,46 +694,13 @@ namespace
 			return true;
 		}
 
-		const FVector2D ResultPos(ResultNode->NodePosX, ResultNode->NodePosY);
-		UEdGraphNode* VarNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_VariableGet::StaticClass(), ResultPos + FVector2D(-450.0, 0.0), [&](UEdGraphNode* NewNode)
+		int32 Row = 0;
+		const FConditionTerm Term = Rule.Kind == ERuleKind::Condition ? Rule.Condition[0] : MakeTerm(Rule);
+		UEdGraphPin* Source = BuildCondition(RuleGraph, Term, FVector2D(ResultNode->NodePosX, ResultNode->NodePosY), 0, Row, OutRuleNodes, OutError);
+		if (!Source)
 		{
-			CastChecked<UK2Node_VariableGet>(NewNode)->VariableReference.SetSelfMember(Rule.Variable);
-		});
-		OutRuleNodes.Add(VarNode);
-		UEdGraphPin* VarPin = AnimMCP::FindPin(VarNode, Rule.Variable.ToString(), TEXT("output"), OutError);
-		if (!VarPin)
-		{
-			OutError = FString::Printf(TEXT("Variable getter for '%s' has no output pin. Compile the blueprint once after adding the variable. %s"), *Rule.Variable.ToString(), *OutError);
 			return false;
 		}
-
-		UEdGraphPin* Source = VarPin;
-		if (Rule.Function)
-		{
-			UEdGraphNode* FunctionNode = AnimMCP::SpawnNode(RuleGraph, UK2Node_CallFunction::StaticClass(), ResultPos + FVector2D(-200.0, 0.0), [&](UEdGraphNode* NewNode)
-			{
-				CastChecked<UK2Node_CallFunction>(NewNode)->SetFromFunction(Rule.Function);
-			});
-			OutRuleNodes.Add(FunctionNode);
-			UEdGraphPin* InA = AnimMCP::FindPin(FunctionNode, TEXT("A"), TEXT("input"), OutError);
-			UEdGraphPin* Out = AnimMCP::FindPin(FunctionNode, TEXT("ReturnValue"), TEXT("output"), OutError);
-			if (!InA || !Out || !Schema->TryCreateConnection(VarPin, InA))
-			{
-				OutError = FString::Printf(TEXT("Failed to wire %s in the transition rule."), *Rule.Function->GetName());
-				return false;
-			}
-			if (Rule.Kind == ERuleKind::Compare)
-			{
-				UEdGraphPin* InB = AnimMCP::FindPin(FunctionNode, TEXT("B"), TEXT("input"), OutError);
-				if (!InB)
-				{
-					return false;
-				}
-				Schema->TrySetDefaultValue(*InB, Rule.ThresholdText);
-			}
-			Source = Out;
-		}
-
 		if (!Schema->TryCreateConnection(Source, ResultPin))
 		{
 			OutError = TEXT("Failed to connect the rule to the transition result.");
@@ -499,6 +763,7 @@ namespace
 		case ERuleKind::NotBool:       return TEXT("not_bool_variable");
 		case ERuleKind::Compare:       return TEXT("compare");
 		case ERuleKind::TimeRemaining: return TEXT("time_remaining");
+		case ERuleKind::Condition:     return TEXT("condition");
 		case ERuleKind::Always:        return TEXT("always");
 		default:                       return TEXT("never");
 		}
@@ -840,6 +1105,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_add_state(const FString& blueprint
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("AddState", "AnimMCP: Add State"));
+	const AnimMCP::FLinkTracker Tracker({ SMGraph });
 	AnimBP->Modify();
 	UAnimStateNode* State = CastChecked<UAnimStateNode>(SpawnNamedStateNode(SMGraph, UAnimStateNode::StaticClass(), name, FVector2D(x, y)));
 
@@ -857,6 +1123,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_add_state(const FString& blueprint
 
 	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(State, /*bIncludePins*/ false);
 	Payload->SetBoolField(TEXT("is_entry"), set_as_entry);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -881,6 +1148,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_state(const FString& bluepr
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveState", "AnimMCP: Remove State"));
+	const AnimMCP::FLinkTracker Tracker({ State->GetGraph() });
 	AnimBP->Modify();
 
 	TArray<TSharedPtr<FJsonValue>> RemovedTransitions;
@@ -895,6 +1163,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_state(const FString& bluepr
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_state_guid"), state_guid);
 	Payload->SetArrayField(TEXT("removed_transition_guids"), RemovedTransitions);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -964,17 +1233,19 @@ FAnimMCPResult UAnimStateMachineToolset::anim_remove_transition(const FString& b
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveTransition", "AnimMCP: Remove Transition"));
+	const AnimMCP::FLinkTracker Tracker({ Transition->GetGraph() });
 	AnimBP->Modify();
 	AnimMCP::RemoveNode(AnimBP, Transition);
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_transition_guid"), transition_guid);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
 FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name, float trigger_time, float crossfade_duration,
-	const FString& comparison, float threshold)
+	const FString& comparison, float threshold, const FString& condition)
 {
 	ANIMMCP_REQUIRE_GAME_THREAD();
 
@@ -1009,6 +1280,20 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	Request.Comparison = comparison;
 	Request.Threshold = threshold;
 	Request.TriggerTime = trigger_time;
+	if (!AnimMCP::IsUnset(condition))
+	{
+		if (!rule.TrimStartAndEnd().Equals(TEXT("condition"), ESearchCase::IgnoreCase))
+		{
+			return AnimMCP::Fail(TEXT("condition is only used with rule='condition'. Leave it at 'none' for other rules."));
+		}
+		TSharedPtr<FJsonObject> ConditionObject;
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(condition);
+		if (!FJsonSerializer::Deserialize(Reader, ConditionObject) || !ConditionObject.IsValid())
+		{
+			return AnimMCP::Fail(FString::Printf(TEXT("condition is not a valid JSON object: %s"), *Reader->GetErrorMessage()));
+		}
+		Request.Condition = MakeShared<FJsonValueObject>(ConditionObject);
+	}
 	FResolvedRule Resolved;
 	if (!ResolveRule(AnimBP, Request, Resolved, Error))
 	{
@@ -1016,6 +1301,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetTransitionRule", "AnimMCP: Set Transition Rule"));
+	const AnimMCP::FLinkTracker Tracker({ Owner->GetBoundGraph() });
 	AnimBP->Modify();
 	if (Transition && crossfade_duration >= 0.f)
 	{
@@ -1043,6 +1329,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_transition_rule(const FString&
 	TSharedRef<FJsonObject> Payload = AnimMCP::NodeToJson(Owner, /*bIncludePins*/ false);
 	Payload->SetStringField(TEXT("rule"), RuleKindToString(Resolved.Kind));
 	Payload->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+	Payload->SetArrayField(TEXT("removed_nodes"), Tracker.RemovedNodes());
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	Payload->SetArrayField(TEXT("warnings"), AnimMCP::ToJsonArray(Warnings));
 	return AnimMCP::Ok(Payload);
 }
@@ -1079,6 +1367,7 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("SetStateAnimation", "AnimMCP: Set State Animation"));
+	const AnimMCP::FLinkTracker Tracker({ State->BoundGraph });
 	AnimBP->Modify();
 	UAnimGraphNode_Base* PoseNode = nullptr;
 	UAnimGraphNode_Base* Player = nullptr;
@@ -1097,6 +1386,8 @@ FAnimMCPResult UAnimStateMachineToolset::anim_set_state_animation(const FString&
 	{
 		Payload->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
 	}
+	Payload->SetArrayField(TEXT("removed_nodes"), Tracker.RemovedNodes());
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -1144,12 +1435,30 @@ namespace
 		FString Category;
 	};
 
+	/** A pin on an anim node driven by a member variable. */
+	struct FSpecBinding
+	{
+		FName Pin;
+		FName Variable;
+	};
+
+	/** An extra anim node chained between a state's animation and its output pose. */
+	struct FSpecExtraNode
+	{
+		UClass* Class = nullptr;
+		FName PoseInput;  // the pose pin the previous node feeds
+		TArray<TPair<FString, FString>> Properties;  // property path -> value text
+		TArray<FSpecBinding> Bindings;
+	};
+
 	struct FSpecNode
 	{
 		FString Name;
 		bool bConduit = false;
 		bool bHasAnimation = false;
 		FStateAnimation Animation;
+		TArray<FSpecBinding> Bindings;  // on the state's asset player
+		TArray<FSpecExtraNode> ExtraNodes;
 		bool bHasRule = false;  // conduits only
 		FResolvedRule Rule;
 		TOptional<FVector2D> Position;
@@ -1159,7 +1468,12 @@ namespace
 	{
 		int32 From = INDEX_NONE;
 		int32 To = INDEX_NONE;
+		bool bWildcard = false;  // expanded from "from": "*"
+		int32 SpecIndex = INDEX_NONE;  // position in the spec's transitions array, for error messages
 		float Crossfade = 0.2f;
+		TOptional<int32> Priority;
+		TOptional<EAlphaBlendOption> BlendMode;
+		UCurveFloat* BlendCurve = nullptr;
 		bool bHasRule = false;
 		FResolvedRule Rule;
 	};
@@ -1282,6 +1596,108 @@ namespace
 			return Result;
 		}
 	};
+
+	bool IsPoseLink(const FProperty* Property)
+	{
+		const FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+		return StructProperty && StructProperty->Struct->IsChildOf(FPoseLinkBase::StaticStruct());
+	}
+
+	/** Runtime-struct properties of an anim node class that the editor can show as pins, so a variable can drive them. */
+	TArray<FProperty*> GetBindableProperties(UClass* NodeClass)
+	{
+		TArray<FProperty*> Result;
+		const UAnimGraphNode_Base* NodeCDO = Cast<UAnimGraphNode_Base>(NodeClass->GetDefaultObject());
+		const UScriptStruct* NodeStruct = NodeCDO ? NodeCDO->GetFNodeType() : nullptr;
+		if (!NodeStruct)
+		{
+			return Result;
+		}
+		const UAnimationGraphSchema* Schema = GetDefault<UAnimationGraphSchema>();
+		for (TFieldIterator<FProperty> It(NodeStruct); It; ++It)
+		{
+			FProperty* Property = *It;
+			const bool bCanBePin = Property->HasMetaData(Schema->NAME_PinShownByDefault) || Property->HasMetaData(Schema->NAME_PinHiddenByDefault) || Property->HasMetaData(Schema->NAME_AlwaysAsPin);
+			if (bCanBePin && !Property->HasMetaData(Schema->NAME_NeverAsPin) && !IsPoseLink(Property))
+			{
+				Result.Add(Property);
+			}
+		}
+		return Result;
+	}
+
+	/** The single pose input an extra node is chained through (e.g. Source, SourcePose, BasePose). NAME_None if it has none. */
+	FName FindChainPoseInput(UClass* NodeClass)
+	{
+		const UAnimGraphNode_Base* NodeCDO = Cast<UAnimGraphNode_Base>(NodeClass->GetDefaultObject());
+		const UScriptStruct* NodeStruct = NodeCDO ? NodeCDO->GetFNodeType() : nullptr;
+		if (NodeStruct)
+		{
+			for (TFieldIterator<FProperty> It(NodeStruct); It; ++It)
+			{
+				if (IsPoseLink(*It))
+				{
+					return It->GetFName();
+				}
+			}
+		}
+		return NAME_None;
+	}
+
+	/** Reads {"Pin": "Variable", ...} for an anim node class, checking the pin can be exposed and the variable's type fits it. */
+	TArray<FSpecBinding> ReadBindings(UBlueprint* Blueprint, UClass* NodeClass, const TSharedPtr<FJsonValue>& Value, const FString& Where, const FPendingVariables& Pending, TArray<FString>& Problems)
+	{
+		TArray<FSpecBinding> Result;
+		const TSharedPtr<FJsonObject>* ObjectPtr = nullptr;
+		if (!Value->TryGetObject(ObjectPtr) || !ObjectPtr || !ObjectPtr->IsValid())
+		{
+			Problems.Add(FString::Printf(TEXT("%s: 'bind' must be an object mapping pin names to variable names, e.g. {\"X\": \"Direction\"}."), *Where));
+			return Result;
+		}
+
+		const TArray<FProperty*> Bindable = GetBindableProperties(NodeClass);
+		const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : (*ObjectPtr)->Values)
+		{
+			FProperty* const* Property = Bindable.FindByPredicate([&Field](const FProperty* Candidate) { return Candidate->GetName().Equals(Field.Key, ESearchCase::IgnoreCase); });
+			if (!Property)
+			{
+				TArray<FString> Names;
+				for (const FProperty* Candidate : Bindable)
+				{
+					Names.Add(Candidate->GetName());
+				}
+				Problems.Add(FString::Printf(TEXT("%s: %s has no pin '%s' that can be driven by a variable. Pins: %s."),
+					*Where, *NodeClass->GetName(), *Field.Key, Names.IsEmpty() ? TEXT("none") : *FString::Join(Names, TEXT(", "))));
+				continue;
+			}
+			if (Field.Value->Type != EJson::String)
+			{
+				Problems.Add(FString::Printf(TEXT("%s: bind '%s' must name a variable."), *Where, *Field.Key));
+				continue;
+			}
+
+			FSpecBinding Binding;
+			Binding.Pin = (*Property)->GetFName();
+			Binding.Variable = FName(*Field.Value->AsString().TrimStartAndEnd());
+			FEdGraphPinType VariableType;
+			FEdGraphPinType PinType;
+			if (!GetVariablePinType(Blueprint, Binding.Variable, &Pending, VariableType))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: bind '%s': '%s' is not a member variable. Declare it in 'variables' or with anim_add_variable."), *Where, *Field.Key, *Field.Value->AsString()));
+				continue;
+			}
+			const bool bBothReal = KindFromPinType(VariableType) == EVariableKind::Real && K2Schema->ConvertPropertyToPinType(*Property, PinType) && KindFromPinType(PinType) == EVariableKind::Real;
+			if (!bBothReal && (!K2Schema->ConvertPropertyToPinType(*Property, PinType) || !K2Schema->ArePinTypesCompatible(VariableType, PinType)))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: bind '%s': variable '%s' is %s but the pin is %s."),
+					*Where, *Field.Key, *Field.Value->AsString(), *AnimMCP::PinTypeToString(VariableType), *AnimMCP::PinTypeToString(PinType)));
+				continue;
+			}
+			Result.Add(Binding);
+		}
+		return Result;
+	}
 
 	/** Parses and validates the whole spec against the blueprint. Nothing is modified. Returns false with every problem listed. */
 	bool ParseStateMachineSpec(UAnimBlueprint* AnimBP, const FString& SpecText, FStateMachineSpec& Out, FString& OutError)
@@ -1424,7 +1840,21 @@ namespace
 		auto ReadRule = [&](const TSharedPtr<FJsonObject>& Item, const FString& Where, FResolvedRule& OutRule) -> bool
 		{
 			FRuleRequest Request;
-			if (!Read.String(Item, Where, TEXT("rule"), Request.Rule))
+			const TSharedPtr<FJsonValue> RuleValue = Read.Find(Item, TEXT("rule"));
+			if (RuleValue.IsValid() && RuleValue->Type == EJson::Object)
+			{
+				// A combined condition: everything it needs is inside the object.
+				for (const TCHAR* Key : { TEXT("variable"), TEXT("variable_name"), TEXT("comparison"), TEXT("threshold") })
+				{
+					if (Read.Find(Item, Key).IsValid())
+					{
+						Problems.Add(FString::Printf(TEXT("%s: '%s' does not apply when 'rule' is a condition object; put it inside the condition."), *Where, Key));
+					}
+				}
+				Request.Rule = TEXT("condition");
+				Request.Condition = RuleValue;
+			}
+			else if (!Read.String(Item, Where, TEXT("rule"), Request.Rule))
 			{
 				return false;
 			}
@@ -1462,7 +1892,7 @@ namespace
 				}
 				else
 				{
-					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("animation"), TEXT("node_type"), TEXT("loop"), TEXT("play_rate"), TEXT("slot_name"), TEXT("x"), TEXT("y") });
+					Read.CheckKeys(Item, Where, { TEXT("name"), TEXT("animation"), TEXT("node_type"), TEXT("loop"), TEXT("play_rate"), TEXT("slot_name"), TEXT("x"), TEXT("y"), TEXT("bind"), TEXT("nodes") });
 				}
 
 				FSpecNode Node;
@@ -1524,6 +1954,97 @@ namespace
 					{
 						Problems.Add(FString::Printf(TEXT("%s: 'node_type', 'loop' and 'play_rate' need an 'animation'."), *Where));
 					}
+
+					if (const TSharedPtr<FJsonValue> Bind = Read.Find(Item, TEXT("bind")); Bind.IsValid() && !Bind->IsNull())
+					{
+						if (Anim.PlayerClass)
+						{
+							Node.Bindings = ReadBindings(AnimBP, Anim.PlayerClass, Bind, Where + TEXT(".bind"), Pending, Problems);
+						}
+						else if (AnimMCP::IsUnset(Anim.AssetPath))  // a bad animation path is already reported
+						{
+							Problems.Add(FString::Printf(TEXT("%s: 'bind' drives pins of the state's animation player, so the state needs an 'animation'. To drive another node, put 'bind' on that entry in 'nodes'."), *Where));
+						}
+					}
+
+					const TArray<TSharedPtr<FJsonObject>> Extras = Read.ObjectArray(Item, TEXT("nodes"));
+					for (int32 ExtraIndex = 0; ExtraIndex < Extras.Num(); ++ExtraIndex)
+					{
+						const TSharedPtr<FJsonObject>& ExtraItem = Extras[ExtraIndex];
+						const FString ExtraWhere = FString::Printf(TEXT("%s.nodes[%d]"), *Where, ExtraIndex);
+						Read.CheckKeys(ExtraItem, ExtraWhere, { TEXT("class"), TEXT("properties"), TEXT("bind") });
+
+						FString ClassName;
+						if (!Read.String(ExtraItem, ExtraWhere, TEXT("class"), ClassName))
+						{
+							Problems.Add(FString::Printf(TEXT("%s: 'class' is required, e.g. 'AnimGraphNode_Slot' or 'AnimGraphNode_ModifyCurve'."), *ExtraWhere));
+							continue;
+						}
+						FSpecExtraNode Extra;
+						Extra.Class = AnimMCP::ResolveNodeClass(ClassName, Error);
+						if (!Extra.Class)
+						{
+							Problems.Add(FString::Printf(TEXT("%s: %s"), *ExtraWhere, *Error));
+							continue;
+						}
+						UEdGraphNode* ExtraCDO = Extra.Class->GetDefaultObject<UEdGraphNode>();
+						if (!Extra.Class->IsChildOf(UAnimGraphNode_Base::StaticClass()) || !ExtraCDO->CanCreateUnderSpecifiedSchema(GetDefault<UAnimationStateGraphSchema>()))
+						{
+							Problems.Add(FString::Printf(TEXT("%s: %s cannot be placed in a state. Use an anim graph node class (see anim_list_node_types)."), *ExtraWhere, *Extra.Class->GetName()));
+							continue;
+						}
+						Extra.PoseInput = FindChainPoseInput(Extra.Class);
+						if (Extra.PoseInput.IsNone())
+						{
+							Problems.Add(FString::Printf(TEXT("%s: %s has no single pose input, so it cannot be chained between the animation and the output pose."), *ExtraWhere, *Extra.Class->GetName()));
+							continue;
+						}
+
+						if (const TSharedPtr<FJsonValue> Properties = Read.Find(ExtraItem, TEXT("properties")); Properties.IsValid() && !Properties->IsNull())
+						{
+							const TSharedPtr<FJsonObject>* PropertiesObject = nullptr;
+							if (!Properties->TryGetObject(PropertiesObject) || !PropertiesObject || !PropertiesObject->IsValid())
+							{
+								Problems.Add(FString::Printf(TEXT("%s: 'properties' must be an object mapping property paths to values, e.g. {\"Node.SlotName\": \"UpperBody\"}."), *ExtraWhere));
+							}
+							else
+							{
+								for (const TPair<FString, TSharedPtr<FJsonValue>>& Property : (*PropertiesObject)->Values)
+								{
+									FString ValueText;
+									if (Property.Value->Type == EJson::String)
+									{
+										ValueText = Property.Value->AsString();
+									}
+									else if (Property.Value->Type == EJson::Boolean)
+									{
+										ValueText = Property.Value->AsBool() ? TEXT("true") : TEXT("false");
+									}
+									else if (Property.Value->Type == EJson::Number)
+									{
+										const double Number = Property.Value->AsNumber();
+										ValueText = FMath::RoundToDouble(Number) == Number && FMath::Abs(Number) < 1e15 ? FString::Printf(TEXT("%lld"), (int64)Number) : FString::SanitizeFloat(Number);
+									}
+									else
+									{
+										Problems.Add(FString::Printf(TEXT("%s: property '%s' must be given as text in Unreal format, a number or true/false."), *ExtraWhere, *Property.Key));
+										continue;
+									}
+									if (!AnimMCP::CanImportPropertyValue(ExtraCDO, Property.Key, ValueText, Error))
+									{
+										Problems.Add(FString::Printf(TEXT("%s: %s"), *ExtraWhere, *Error));
+										continue;
+									}
+									Extra.Properties.Emplace(Property.Key, ValueText);
+								}
+							}
+						}
+						if (const TSharedPtr<FJsonValue> Bind = Read.Find(ExtraItem, TEXT("bind")); Bind.IsValid() && !Bind->IsNull())
+						{
+							Extra.Bindings = ReadBindings(AnimBP, Extra.Class, Bind, ExtraWhere + TEXT(".bind"), Pending, Problems);
+						}
+						Node.ExtraNodes.Add(MoveTemp(Extra));
+					}
 				}
 				Out.Nodes.Add(MoveTemp(Node));
 			}
@@ -1556,28 +2077,37 @@ namespace
 			Out.EntryIndex = 0;
 		}
 
-		// Transitions.
+		// Transitions. "from": "*" is expanded once every explicit transition is known, so an explicit one always wins.
+		const UEnum* BlendModeEnum = StaticEnum<EAlphaBlendOption>();
+		TArray<FSpecTransition> Parsed;
 		const TArray<TSharedPtr<FJsonObject>> Transitions = Read.ObjectArray(Root, TEXT("transitions"));
 		for (int32 Index = 0; Index < Transitions.Num(); ++Index)
 		{
 			const TSharedPtr<FJsonObject>& Item = Transitions[Index];
 			const FString Where = FString::Printf(TEXT("transitions[%d]"), Index);
-			Read.CheckKeys(Item, Where, { TEXT("from"), TEXT("to"), TEXT("crossfade_duration"), TEXT("rule"), TEXT("variable"), TEXT("variable_name"), TEXT("comparison"), TEXT("threshold"), TEXT("trigger_time") });
+			Read.CheckKeys(Item, Where, { TEXT("from"), TEXT("to"), TEXT("crossfade_duration"), TEXT("priority"), TEXT("blend_mode"), TEXT("blend_curve"),
+				TEXT("rule"), TEXT("variable"), TEXT("variable_name"), TEXT("comparison"), TEXT("threshold"), TEXT("trigger_time") });
 
 			FSpecTransition Transition;
+			Transition.SpecIndex = Index;
 			FString From, To;
 			if (!Read.String(Item, Where, TEXT("from"), From) || !Read.String(Item, Where, TEXT("to"), To))
 			{
 				Problems.Add(FString::Printf(TEXT("%s: 'from' and 'to' are required."), *Where));
 				continue;
 			}
-			Transition.From = FindNodeIndex(From);
+			Transition.bWildcard = From.TrimStartAndEnd() == TEXT("*");
+			Transition.From = Transition.bWildcard ? INDEX_NONE : FindNodeIndex(From);
 			Transition.To = FindNodeIndex(To);
-			if (Transition.From == INDEX_NONE)
+			if (!Transition.bWildcard && Transition.From == INDEX_NONE)
 			{
 				Problems.Add(FString::Printf(TEXT("%s: 'from' state '%s' is not in the spec."), *Where, *From));
 			}
-			if (Transition.To == INDEX_NONE)
+			if (To.TrimStartAndEnd() == TEXT("*"))
+			{
+				Problems.Add(FString::Printf(TEXT("%s: only 'from' may be '*'; 'to' must name one state or conduit."), *Where));
+			}
+			else if (Transition.To == INDEX_NONE)
 			{
 				Problems.Add(FString::Printf(TEXT("%s: 'to' state '%s' is not in the spec."), *Where, *To));
 			}
@@ -1589,14 +2119,224 @@ namespace
 			}
 			Transition.Crossfade = (float)Crossfade;
 
+			double Priority = 0.0;
+			if (Read.Number(Item, Where, TEXT("priority"), Priority))
+			{
+				if (FMath::RoundToDouble(Priority) != Priority || Priority < MIN_int32 || Priority > MAX_int32)
+				{
+					Problems.Add(FString::Printf(TEXT("%s: priority must be a whole number (got %g). When several transitions out of a state are true at once, the lowest priority is taken."), *Where, Priority));
+				}
+				else
+				{
+					Transition.Priority = (int32)Priority;
+				}
+			}
+
+			FString BlendModeName;
+			if (Read.String(Item, Where, TEXT("blend_mode"), BlendModeName))
+			{
+				const int64 Value = BlendModeEnum->GetValueByNameString(BlendModeName.TrimStartAndEnd());
+				if (Value == INDEX_NONE || Value == BlendModeEnum->GetMaxEnumValue())
+				{
+					TArray<FString> Names;
+					for (int32 EnumIndex = 0; EnumIndex < BlendModeEnum->NumEnums() - 1; ++EnumIndex)
+					{
+						Names.Add(BlendModeEnum->GetNameStringByIndex(EnumIndex));
+					}
+					Problems.Add(FString::Printf(TEXT("%s: unknown blend_mode '%s'. Use one of: %s."), *Where, *BlendModeName, *FString::Join(Names, TEXT(", "))));
+				}
+				else
+				{
+					Transition.BlendMode = (EAlphaBlendOption)Value;
+				}
+			}
+
+			FString CurvePath;
+			if (Read.String(Item, Where, TEXT("blend_curve"), CurvePath) && !AnimMCP::IsUnset(CurvePath))
+			{
+				Transition.BlendCurve = AnimMCP::LoadAsset<UCurveFloat>(CurvePath, /*bForWrite*/ false, Error);
+				if (!Transition.BlendCurve)
+				{
+					Problems.Add(FString::Printf(TEXT("%s: blend_curve: %s"), *Where, *Error));
+				}
+				else if (Transition.BlendMode.IsSet() && Transition.BlendMode.GetValue() != EAlphaBlendOption::Custom)
+				{
+					Problems.Add(FString::Printf(TEXT("%s: blend_curve is only used with blend_mode 'Custom'. Set blend_mode to Custom or leave it out."), *Where));
+				}
+				else
+				{
+					Transition.BlendMode = EAlphaBlendOption::Custom;
+				}
+			}
+
 			Transition.bHasRule = ReadRule(Item, Where, Transition.Rule);
-			Out.Transitions.Add(Transition);
+			Parsed.Add(MoveTemp(Transition));
+		}
+
+		TSet<TPair<int32, int32>> Explicit;
+		for (const FSpecTransition& Transition : Parsed)
+		{
+			if (!Transition.bWildcard)
+			{
+				Explicit.Add({ Transition.From, Transition.To });
+			}
+		}
+		for (int32 Index = 0; Index < Parsed.Num(); ++Index)
+		{
+			const FSpecTransition& Transition = Parsed[Index];
+			if (!Transition.bWildcard)
+			{
+				Out.Transitions.Add(Transition);
+				continue;
+			}
+			if (Transition.To == INDEX_NONE)
+			{
+				continue;
+			}
+			int32 Expanded = 0;
+			for (int32 StateIndex = 0; StateIndex < NumStates; ++StateIndex)
+			{
+				if (StateIndex != Transition.To && !Explicit.Contains({ StateIndex, Transition.To }))
+				{
+					FSpecTransition& Copy = Out.Transitions.Add_GetRef(Transition);
+					Copy.From = StateIndex;
+					++Expanded;
+				}
+			}
+			if (Expanded == 0)
+			{
+				Problems.Add(FString::Printf(TEXT("transitions[%d]: 'from': '*' expands to no transitions (every other state already has an explicit transition to '%s')."), Transition.SpecIndex, *Out.Nodes[Transition.To].Name));
+			}
 		}
 
 		if (!Problems.IsEmpty())
 		{
 			OutError = FString::Printf(TEXT("Nothing was created. The spec has %d problem(s):\n- %s"), Problems.Num(), *FString::Join(Problems, TEXT("\n- ")));
 			return false;
+		}
+		return true;
+	}
+
+	/** Shows each bound pin on the node (if it is optional and hidden) and wires a variable getter into it. The caller owns the transaction. */
+	bool ApplyBindings(UAnimGraphNode_Base* Node, const TArray<FSpecBinding>& Bindings, TArray<TSharedRef<FJsonObject>>& OutItems, FString& OutError)
+	{
+		UEdGraph* Graph = Node->GetGraph();
+		const UEdGraphSchema* Schema = Graph->GetSchema();
+		for (int32 Index = 0; Index < Bindings.Num(); ++Index)
+		{
+			const FSpecBinding& Binding = Bindings[Index];
+			const int32 OptionalIndex = Node->ShowPinForProperties.IndexOfByPredicate([&Binding](const FOptionalPinFromProperty& Optional) { return Optional.PropertyName == Binding.Pin; });
+			if (OptionalIndex != INDEX_NONE && !Node->ShowPinForProperties[OptionalIndex].bShowPin)
+			{
+				Node->Modify();
+				Node->SetPinVisibility(/*bInVisible*/ true, OptionalIndex);
+			}
+			UEdGraphPin* Pin = AnimMCP::FindPin(Node, Binding.Pin.ToString(), TEXT("input"), OutError);
+			if (!Pin)
+			{
+				return false;
+			}
+
+			const FVector2D Position(Node->NodePosX - 250.0, Node->NodePosY + 150.0 + 80.0 * Index);
+			UEdGraphNode* Getter = AnimMCP::SpawnNode(Graph, UK2Node_VariableGet::StaticClass(), Position, [&Binding](UEdGraphNode* NewNode)
+			{
+				CastChecked<UK2Node_VariableGet>(NewNode)->VariableReference.SetSelfMember(Binding.Variable);
+			});
+			UEdGraphPin* VarPin = AnimMCP::FindPin(Getter, Binding.Variable.ToString(), TEXT("output"), OutError);
+			if (!VarPin || !Schema->TryCreateConnection(VarPin, Pin))
+			{
+				OutError = FString::Printf(TEXT("Could not connect variable '%s' to pin '%s' of %s."), *Binding.Variable.ToString(), *Binding.Pin.ToString(), *Node->GetClass()->GetName());
+				return false;
+			}
+
+			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("pin"), Binding.Pin.ToString());
+			Item->SetStringField(TEXT("variable"), Binding.Variable.ToString());
+			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Node->NodeGuid));
+			Item->SetStringField(TEXT("getter_node_guid"), AnimMCP::GuidToString(Getter->NodeGuid));
+			OutItems.Add(Item);
+		}
+		return true;
+	}
+
+	/**
+	 * Binds the state's animation player and chains the extra nodes between the state's animation and its output pose:
+	 * animation -> nodes[0] -> nodes[1] -> ... -> Output Pose. The caller owns the transaction.
+	 */
+	bool ApplyStateExtras(UAnimStateNode* State, const FSpecNode& Spec, UAnimGraphNode_Base* PoseNode, UAnimGraphNode_Base* Player, const TSharedRef<FJsonObject>& Item, FString& OutError)
+	{
+		TArray<TSharedRef<FJsonObject>> BindingItems;
+		if (Player && !ApplyBindings(Player, Spec.Bindings, BindingItems, OutError))
+		{
+			return false;
+		}
+
+		TArray<TSharedRef<FJsonObject>> NodeItems;
+		if (!Spec.ExtraNodes.IsEmpty())
+		{
+			UEdGraph* StateGraph = State->BoundGraph;
+			const UEdGraphSchema* Schema = StateGraph->GetSchema();
+			UEdGraphPin* PoseSink = State->GetPoseSinkPinInsideState();
+			const UAnimGraphNode_StateResult* ResultNode = State->GetResultNodeInsideState();
+			const double Step = 300.0;
+			const int32 Count = Spec.ExtraNodes.Num();
+
+			// Make room: the animation nodes move left, the extra nodes take their place in front of the output.
+			for (UAnimGraphNode_Base* Moved : TSet<UAnimGraphNode_Base*>{ PoseNode, Player })
+			{
+				if (Moved)
+				{
+					Moved->Modify();
+					Moved->NodePosX -= FMath::RoundToInt(Step * Count);
+				}
+			}
+			UEdGraphPin* Upstream = PoseNode ? AnimMCP::FindFirstPin(PoseNode, EGPD_Output) : nullptr;
+			Schema->BreakPinLinks(*PoseSink, /*bSendsNodeNotifcation*/ true);
+
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				const FSpecExtraNode& Extra = Spec.ExtraNodes[Index];
+				const FVector2D Position(ResultNode->NodePosX - Step * (Count - Index), ResultNode->NodePosY);
+				UAnimGraphNode_Base* Node = CastChecked<UAnimGraphNode_Base>(AnimMCP::SpawnNode(StateGraph, Extra.Class, Position));
+				for (const TPair<FString, FString>& Property : Extra.Properties)
+				{
+					FString ReadBack;
+					if (!AnimMCP::SetNodePropertyByPath(Node, Property.Key, Property.Value, ReadBack, OutError))
+					{
+						return false;
+					}
+				}
+				if (!ApplyBindings(Node, Extra.Bindings, BindingItems, OutError))
+				{
+					return false;
+				}
+				UEdGraphPin* PoseIn = AnimMCP::FindPin(Node, Extra.PoseInput.ToString(), TEXT("input"), OutError);
+				if (!PoseIn || (Upstream && !Schema->TryCreateConnection(Upstream, PoseIn)))
+				{
+					OutError = FString::Printf(TEXT("Could not chain %s after the previous node: %s"), *Extra.Class->GetName(), *OutError);
+					return false;
+				}
+				Upstream = AnimMCP::FindFirstPin(Node, EGPD_Output);
+
+				TSharedRef<FJsonObject> NodeItem = MakeShared<FJsonObject>();
+				NodeItem->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+				NodeItem->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Node->NodeGuid));
+				NodeItems.Add(NodeItem);
+			}
+			if (!Upstream || !Schema->TryCreateConnection(Upstream, PoseSink))
+			{
+				OutError = TEXT("Could not connect the last node to the state's output pose.");
+				return false;
+			}
+		}
+
+		if (!NodeItems.IsEmpty())
+		{
+			Item->SetArrayField(TEXT("nodes"), AnimMCP::ToJsonArray(NodeItems));
+		}
+		if (!BindingItems.IsEmpty())
+		{
+			Item->SetArrayField(TEXT("bindings"), AnimMCP::ToJsonArray(BindingItems));
 		}
 		return true;
 	}
@@ -1661,10 +2401,10 @@ namespace
 			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 			Item->SetStringField(TEXT("name"), StateNode->GetStateName());
 			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(StateNode->NodeGuid));
+			UAnimGraphNode_Base* PoseNode = nullptr;
+			UAnimGraphNode_Base* Player = nullptr;
 			if (Node.bHasAnimation)
 			{
-				UAnimGraphNode_Base* PoseNode = nullptr;
-				UAnimGraphNode_Base* Player = nullptr;
 				if (!ApplyStateAnimation(AnimBP, CastChecked<UAnimStateNode>(StateNode), Node.Animation, PoseNode, Player, OutError))
 				{
 					OutError = FString::Printf(TEXT("State '%s': %s"), *Node.Name, *OutError);
@@ -1679,6 +2419,11 @@ namespace
 				{
 					Item->SetStringField(TEXT("slot_node_guid"), AnimMCP::GuidToString(PoseNode->NodeGuid));
 				}
+			}
+			if (!Node.bConduit && !ApplyStateExtras(CastChecked<UAnimStateNode>(StateNode), Node, PoseNode, Player, Item, OutError))
+			{
+				OutError = FString::Printf(TEXT("State '%s': %s"), *Node.Name, *OutError);
+				return false;
 			}
 			if (Node.bConduit)
 			{
@@ -1715,6 +2460,18 @@ namespace
 			UAnimStateTransitionNode* Transition = CastChecked<UAnimStateTransitionNode>(AnimMCP::SpawnNode(SMGraph, UAnimStateTransitionNode::StaticClass(), Midpoint));
 			Transition->CreateConnections(From, To);
 			Transition->CrossfadeDuration = SpecTransition.Crossfade;
+			if (SpecTransition.Priority.IsSet())
+			{
+				Transition->PriorityOrder = SpecTransition.Priority.GetValue();
+			}
+			if (SpecTransition.BlendMode.IsSet())
+			{
+				Transition->BlendMode = SpecTransition.BlendMode.GetValue();
+			}
+			if (SpecTransition.BlendCurve)
+			{
+				Transition->CustomBlendCurve = SpecTransition.BlendCurve;
+			}
 
 			TArray<UEdGraphNode*> RuleNodes;
 			if (SpecTransition.bHasRule && !ApplyRule(AnimBP, Transition, SpecTransition.Rule, RuleNodes, OutError))
@@ -1729,6 +2486,12 @@ namespace
 			Item->SetStringField(TEXT("node_guid"), AnimMCP::GuidToString(Transition->NodeGuid));
 			Item->SetStringField(TEXT("rule"), SpecTransition.bHasRule ? RuleKindToString(SpecTransition.Rule.Kind) : FString(TEXT("never")));
 			Item->SetArrayField(TEXT("rule_nodes"), NodeGuidArray(RuleNodes));
+			Item->SetNumberField(TEXT("priority"), Transition->PriorityOrder);
+			Item->SetStringField(TEXT("blend_mode"), StaticEnum<EAlphaBlendOption>()->GetNameStringByValue((int64)Transition->BlendMode));
+			if (SpecTransition.bWildcard)
+			{
+				Item->SetBoolField(TEXT("from_wildcard"), true);
+			}
 			TransitionItems.Add(Item);
 			TransitionNodes.Add(Transition);
 		}
@@ -1800,7 +2563,9 @@ FAnimMCPResult UAnimStateMachineToolset::anim_build_state_machine(const FString&
 	bool bApplied = false;
 	{
 		const FScopedTransaction Transaction(LOCTEXT("BuildStateMachine", "AnimMCP: Build State Machine"));
+		const AnimMCP::FLinkTracker Tracker({ Spec.Graph });
 		bApplied = ApplyStateMachineSpec(AnimBP, Spec, Payload, Error);
+		Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 	}
 	if (!bApplied)

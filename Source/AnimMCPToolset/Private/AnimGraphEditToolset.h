@@ -42,7 +42,7 @@ public:
 	 * Use anim_remove_state / anim_remove_transition for state machine nodes.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param node_guid GUID of the node to remove.
-	 * @return Result: {removed_node_guid}.
+	 * @return Result: {removed_node_guid, disconnected}. disconnected lists every link the removal broke: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}].
 	 */
 	UFUNCTION(Category = "AnimMCP|Graph", meta = (AICallable))
 	static FAnimMCPResult anim_remove_node(const FString& blueprint_path, const FString& node_guid);
@@ -60,13 +60,13 @@ public:
 
 	/**
 	 * Connects an output pin to an input pin. Both nodes must be in the same graph. The graph schema validates the link;
-	 * if the input pin only accepts one link (e.g. a pose input), its existing link is replaced.
+	 * if the input pin only accepts one link (e.g. a pose input), its existing link is replaced, and the result says which link that was.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param from_node_guid GUID of the node that owns the output pin.
 	 * @param from_pin Name of the output pin, e.g. 'Pose' or 'ReturnValue'.
 	 * @param to_node_guid GUID of the node that owns the input pin.
 	 * @param to_pin Name of the input pin, e.g. 'Result', 'A', 'Alpha'.
-	 * @return Result: {connected, replaced_existing_links, message}.
+	 * @return Result: {connected, replaced_existing_links, disconnected, message}. disconnected lists every link the connection replaced: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}].
 	 */
 	UFUNCTION(Category = "AnimMCP|Graph", meta = (AICallable))
 	static FAnimMCPResult anim_connect_pins(const FString& blueprint_path, const FString& from_node_guid, const FString& from_pin, const FString& to_node_guid, const FString& to_pin);
@@ -78,7 +78,7 @@ public:
 	 * @param pin Name of the pin.
 	 * @param to_node_guid GUID of the node on the other end of the link. '*' = break every link on the pin.
 	 * @param to_pin Name of the pin on the other end. Required when to_node_guid is a GUID.
-	 * @return Result: {links_broken}.
+	 * @return Result: {links_broken, disconnected: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]}.
 	 */
 	UFUNCTION(Category = "AnimMCP|Graph", meta = (AICallable))
 	static FAnimMCPResult anim_disconnect_pins(const FString& blueprint_path, const FString& node_guid, const FString& pin, const FString& to_node_guid = TEXT("*"), const FString& to_pin = TEXT("*"));
@@ -104,7 +104,7 @@ public:
 	 * @param node_guid GUID of the node.
 	 * @param property_path Dotted path to the property; array elements use [index].
 	 * @param value New value in Unreal text format, e.g. '0.2', 'true', '(BoneName="hand_r")'.
-	 * @return Result: {property_path, value} with the value read back after the change.
+	 * @return Result: {property_path, value, disconnected} with the value read back after the change. disconnected lists links lost because the change removed pins (e.g. fewer blend poses).
 	 */
 	UFUNCTION(Category = "AnimMCP|Graph", meta = (AICallable))
 	static FAnimMCPResult anim_set_node_property(const FString& blueprint_path, const FString& node_guid, const FString& property_path, const FString& value);

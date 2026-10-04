@@ -42,7 +42,7 @@ public:
 	 * @param x Horizontal position inside the state machine graph.
 	 * @param y Vertical position inside the state machine graph.
 	 * @param set_as_entry If true, the state machine's Entry node is wired to this state, replacing any previous entry state.
-	 * @return Result: the new state node with node_guid and its inner graph.
+	 * @return Result: the new state node with node_guid and its inner graph, plus disconnected (the previous Entry link, when set_as_entry replaced it): [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}].
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_add_state(const FString& blueprint_path, const FString& state_machine_guid, const FString& name, float x = 0.f, float y = 0.f, bool set_as_entry = false);
@@ -51,7 +51,7 @@ public:
 	 * Removes a state or conduit and every transition into or out of it.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param state_guid node_guid of the state or conduit.
-	 * @return Result: {removed_state_guid, removed_transition_guids}.
+	 * @return Result: {removed_state_guid, removed_transition_guids, disconnected: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]}.
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_remove_state(const FString& blueprint_path, const FString& state_guid);
@@ -72,7 +72,7 @@ public:
 	 * Removes a transition.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param transition_guid node_guid of the transition.
-	 * @return Result: {removed_transition_guid}.
+	 * @return Result: {removed_transition_guid, disconnected: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]}.
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_remove_transition(const FString& blueprint_path, const FString& transition_guid);
@@ -86,21 +86,26 @@ public:
 	 *  'not_bool_variable' - take it while that bool variable is false (needs variable_name);
 	 *  'compare' - take it while a float or int member variable compares true against a number, e.g. Speed > 10
 	 *              (needs variable_name, comparison and threshold). The comparison is built inside the rule graph, so no helper bool is needed;
+	 *  'condition' - a combination of bool and compare checks with and / or / not (needs condition), e.g. bIsMoving AND Speed > 10;
 	 *  'time_remaining' - automatic rule: take it when the source state's animation is about to finish (uses trigger_time);
 	 *  'always' - always true; 'never' - always false.
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param transition_guid node_guid of the transition, or of a conduit to set the conduit's entry rule (time_remaining does not apply to conduits).
-	 * @param rule One of: bool_variable, not_bool_variable, compare, time_remaining, always, never.
+	 * @param rule One of: bool_variable, not_bool_variable, compare, condition, time_remaining, always, never.
 	 * @param variable_name Member variable the rule reads: a bool for bool_variable / not_bool_variable, a float, int, int64 or byte for compare. Create it with anim_add_variable if needed. 'none' for other rules.
 	 * @param trigger_time For time_remaining: seconds before the end of the source animation at which to transition. Negative = use the crossfade duration.
 	 * @param crossfade_duration Optional new blend time in seconds (transitions only). Negative = leave unchanged.
 	 * @param comparison For compare: one of >, >=, <, <=, ==, !=. The rule is 'variable <comparison> threshold'.
 	 * @param threshold For compare: the number to compare against. Must be a whole number when the variable is an int, int64 or byte.
-	 * @return Result: the updated transition (or conduit) node plus rule, rule_nodes (node_guids created in the rule graph) and warnings.
+	 * @param condition For rule 'condition': JSON text of one condition object, where a condition is {"bool": "Var"},
+	 *        {"compare": "Var", "comparison": ">", "threshold": 10}, {"not": condition}, {"and": [condition, condition, ...]} or {"or": [...]}.
+	 *        Example: {"and": [{"bool": "bIsMoving"}, {"not": {"bool": "bIsFalling"}}, {"compare": "Speed", "comparison": ">", "threshold": 10}]}. 'none' for other rules.
+	 * @return Result: the updated transition (or conduit) node plus rule, rule_nodes (node_guids created in the rule graph), removed_nodes
+	 *         ([{node_guid, title, class}] of the old rule), disconnected (links of the old rule: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]) and warnings.
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_set_transition_rule(const FString& blueprint_path, const FString& transition_guid, const FString& rule, const FString& variable_name = TEXT("none"), float trigger_time = -1.f, float crossfade_duration = -1.f,
-		const FString& comparison = TEXT(">"), float threshold = 0.f);
+		const FString& comparison = TEXT(">"), float threshold = 0.f, const FString& condition = TEXT("none"));
 
 	/**
 	 * Makes a state play an animation: creates the node inside the state and wires it to the state's output pose,
@@ -118,7 +123,8 @@ public:
 	 * @param loop Whether the animation loops. False is typical for one-shot states such as Land or JumpStart.
 	 * @param play_rate Play rate multiplier for players (negative plays in reverse). Must be 1 for evaluators.
 	 * @param slot_name For node_type 'slot': the montage slot, e.g. 'DefaultSlot' or 'UpperBody'.
-	 * @return Result: the node wired to the state output, plus player_node_guid and (for slots) slot_node_guid.
+	 * @return Result: the node wired to the state output, plus player_node_guid, (for slots) slot_node_guid, removed_nodes ([{node_guid, title, class}] replaced)
+	 *         and disconnected (links that were replaced: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]).
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_set_state_animation(const FString& blueprint_path, const FString& state_guid, const FString& asset_path,
@@ -149,18 +155,34 @@ public:
 	 *   "variables": [ {"name": "Speed", "type": "float", "default": "0", "category": "Locomotion"} ],
 	 *                                      // created if missing, reused if they already exist with the same type
 	 *   "entry_state": "Idle",             // default: the first state
-	 *   "states": [ {"name": "Idle", "animation": "/Game/Anims/Idle", "loop": true, "play_rate": 1.0, "x": 300, "y": 0} ],
+	 *   "states": [ {"name": "Idle", "animation": "/Game/Anims/Idle", "loop": true, "play_rate": 1.0, "x": 300, "y": 0},
+	 *               {"name": "Move", "animation": "/Game/Anims/BS_Move", "bind": {"X": "Direction", "Y": "Speed"},
+	 *                "nodes": [ {"class": "AnimGraphNode_Slot", "properties": {"Node.SlotName": "UpperBody"}},
+	 *                           {"class": "AnimGraphNode_ModifyCurve", "properties": {"Node.CurveMap": "((\"Lean\", 1.0))"}, "bind": {"Alpha": "LeanAlpha"}} ]} ],
 	 *                                      // animation is optional; node_type and slot_name work as in anim_set_state_animation;
+	 *                                      // bind: pin name -> variable, drives a pin of the state's animation player (X/Y of a blend space, ExplicitTime of an evaluator, PlayRate...);
+	 *                                      //       hidden optional pins are exposed automatically; the variable's type must fit the pin;
+	 *                                      // nodes: anim nodes chained in order between the animation and the output pose; properties use anim_set_node_property paths;
 	 *                                      // positions default to a grid
 	 *   "conduits": [ {"name": "Branch", "rule": "bool_variable", "variable": "bIsFalling"} ],  // rule fields as for transitions
 	 *   "transitions": [ {"from": "Idle", "to": "Run", "rule": "compare", "variable": "Speed", "comparison": ">", "threshold": 10,
-	 *                     "crossfade_duration": 0.2} ]
-	 *                                      // rule fields as in anim_set_transition_rule: rule, variable, comparison, threshold, trigger_time
+	 *                     "crossfade_duration": 0.2, "priority": 1, "blend_mode": "HermiteCubic"},
+	 *                    {"from": "*", "to": "Fall", "rule": {"and": [{"bool": "bIsFalling"}, {"not": {"bool": "bOnLadder"}}]}, "priority": 0} ]
+	 *                                      // rule fields as in anim_set_transition_rule: rule, variable, comparison, threshold, trigger_time;
+	 *                                      // rule may also be a condition object (see anim_set_transition_rule 'condition') combining bool and compare checks;
+	 *                                      // "from": "*" adds one transition from every state (not conduits) except the target; an explicit transition
+	 *                                      //   between the same two states replaces the wildcard one;
+	 *                                      // priority: lower is checked first when several transitions out of a state are true (engine default 1);
+	 *                                      // blend_mode: an EAlphaBlendOption name (Linear, Cubic, HermiteCubic, Sinusoidal, QuadraticInOut, CubicInOut, ..., Custom);
+	 *                                      // blend_curve: a CurveFloat asset for blend_mode Custom (blend_mode may be left out)
 	 * }
 	 * @param blueprint_path Asset path of the Animation Blueprint (must be under /Game).
 	 * @param spec The state machine description as JSON text (see above).
-	 * @return Result: {state_machine, state_machine_graph_guid, entry_node_guid, variables_created, variables_reused, states: [{name, node_guid, player_node_guid}], conduits: [{name, node_guid, rule, rule_nodes}], transitions: [{from, to, node_guid, rule, rule_nodes}], warnings}.
+	 * @return Result: {state_machine, state_machine_graph_guid, entry_node_guid, variables_created, variables_reused,
+	 *         states: [{name, node_guid, player_node_guid, nodes: [{class, node_guid}], bindings: [{pin, variable, node_guid, getter_node_guid}]}],
+	 *         conduits: [{name, node_guid, rule, rule_nodes}], transitions: [{from, to, node_guid, rule, rule_nodes, priority, blend_mode, from_wildcard}], warnings}.
 	 *         warnings lists rules that were built but cannot fire as things stand (missing rules, time_remaining from a state with no animation).
+	 *         disconnected lists links in the target graph that the build replaced (with connect_to_output, the Output Pose's previous input).
 	 */
 	UFUNCTION(Category = "AnimMCP|StateMachine", meta = (AICallable))
 	static FAnimMCPResult anim_build_state_machine(const FString& blueprint_path, const FString& spec);

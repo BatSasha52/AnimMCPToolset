@@ -3,6 +3,11 @@
 #
 #   UnrealEditor-Cmd.exe <Project>.uproject -run=pythonscript -script=<path>/smoke_test.py -unattended -nullrhi
 #
+# The commandlet has no undo buffer, so the undo checks are skipped there. To include them, run the full editor
+# headless instead (the script quits the editor when it is done):
+#
+#   UnrealEditor-Cmd.exe <Project>.uproject -ExecutePythonScript=<path>/smoke_test.py -unattended -nullrhi -nosplash -nosound
+#
 # It creates assets under /Game/AMCPTest, so the project must not already contain that folder.
 # Results go to $ANIMMCP_SMOKE_OUT (default <Project>/Saved/animmcp_smoke.txt); the last line is the summary.
 import json, os, unreal
@@ -12,6 +17,10 @@ OUT = open(os.environ.get("ANIMMCP_SMOKE_OUT") or os.path.join(unreal.Paths.proj
 def log(msg):
     LOG.append(msg)
     OUT.write(msg + "\n"); OUT.flush()
+
+# Undo needs the editor's transaction buffer; the -run=pythonscript commandlet has none (begin_transaction returns -1).
+TRANSACTIONS = unreal.SystemLibrary.begin_transaction("AnimMCP smoke test", "probe", None) != -1
+unreal.SystemLibrary.end_transaction()
 
 def call(toolset, tool, **args):
     r = unreal.ToolsetRegistry.execute_tool("AnimMCPToolset." + toolset, tool, json.dumps(args))
@@ -34,8 +43,16 @@ def expect_fail(toolset, tool, **args):
     env = call(toolset, tool, **args)
     if env is not None and not env.get("success"):
         log("OK   %s rejected as expected: %s" % (tool, env.get("error")))
-    else:
-        log("FAIL %s should have been rejected" % tool)
+        return env.get("error") or ""
+    log("FAIL %s should have been rejected" % tool)
+    return ""
+
+def check(cond, what, detail=""):
+    log("%s %s%s" % ("OK  " if cond else "FAIL", what, (": %s" % (detail,)) if detail != "" else ""))
+    return cond
+
+def pins_of(node):
+    return {p["name"]: p for p in node.get("pins", [])}
 
 schemas = json.loads(unreal.ToolsetRegistry.get_all_toolset_json_schemas())
 ours = [s for s in schemas if s["name"].startswith("AnimMCPToolset.")]
@@ -286,5 +303,461 @@ log("%s qualified tool name: schema=%s qualified_error=%r short_error=%r" % (
     "OK  " if qualified and qualified[0].startswith("AnimMCPToolset.") and "Unknown tool" in (rq.error or "") and not rs.error else "FAIL",
     qualified, rq.error, rs.error))
 
+# --- v0.3 step 1: anim_build_state_machine upgrades (wildcard, bindings, extra nodes, combined conditions, priority, blend settings)
+BP4 = "/Game/AMCPTest/ABP_Spec"
+BS = "/Game/AMCPTest/BS_Test"
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Spec", skeleton_path=SK)
+curve = unreal.AssetToolsHelpers.get_asset_tools().create_asset("CV_Blend", "/Game/AMCPTest", unreal.CurveFloat, unreal.CurveFloatFactory())
+check(curve is not None, "blend curve asset created for the test")
+
+def state_machines(bp):
+    r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=bp, graph="AnimGraph")
+    return [n for n in r["nodes"] if n["class"] == "AnimGraphNode_StateMachine"] if r else []
+
+spec5 = {"name": "Loco", "connect_to_output": True,
+         "variables": [{"name": "Speed", "type": "float"}, {"name": "Rate", "type": "float", "default": "1"}, {"name": "Lean", "type": "float"},
+                       {"name": "bFalling", "type": "bool"}, {"name": "bLadder", "type": "bool"}],
+         "states": [{"name": "Idle", "animation": IDLE},
+                    {"name": "Move", "animation": BS, "bind": {"X": "Speed"}},
+                    {"name": "Walk", "animation": WALK, "bind": {"playrate": "Rate"},
+                     "nodes": [{"class": "AnimGraphNode_Slot", "properties": {"Node.SlotName": "UpperBody"}},
+                               {"class": "AnimGraphNode_ModifyCurve", "properties": {"Node.CurveMap": "((\"Lean\", 1.0))"}, "bind": {"Alpha": "Lean"}}]},
+                    {"name": "Fall", "animation": IDLE}],
+         "transitions": [{"from": "Idle", "to": "Move", "priority": 2, "blend_mode": "Linear",
+                          "rule": {"and": [{"compare": "Speed", "comparison": ">", "threshold": 10}, {"not": {"bool": "bFalling"}}]}},
+                         {"from": "Move", "to": "Walk", "blend_curve": "/Game/AMCPTest/CV_Blend",
+                          "rule": {"or": [{"bool": "bLadder"}, {"compare": "Speed", "comparison": "<", "threshold": 5}, {"bool": "bFalling"}]}},
+                         {"from": "*", "to": "Fall", "rule": "bool_variable", "variable": "bFalling", "priority": 0, "crossfade_duration": 0.1},
+                         {"from": "Idle", "to": "Fall", "rule": "always"}]}
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(spec5))
+if r:
+    tr = {(t["from"], t["to"]): t for t in r["transitions"]}
+    wild = sorted(t["from"] for t in r["transitions"] if t.get("from_wildcard"))
+    check(len(r["transitions"]) == 5 and wild == ["Move", "Walk"] and not tr[("Idle", "Fall")].get("from_wildcard"),
+          "wildcard expands to every other state, explicit Idle->Fall wins", sorted(tr.keys()))
+    check(all(tr[(f, "Fall")]["priority"] == 0 for f in wild) and tr[("Idle", "Fall")]["priority"] == 1 and tr[("Idle", "Fall")]["rule"] == "always",
+          "wildcard transitions carry the spec's priority and rule", [(k, v["priority"], v["rule"]) for k, v in tr.items()])
+    t = tr[("Idle", "Move")]
+    check(t["rule"] == "condition" and t["priority"] == 2 and t["blend_mode"] == "Linear" and len(t["rule_nodes"]) == 5,
+          "and/not/compare condition, priority 2, blend Linear", (t["rule"], t["priority"], t["blend_mode"], len(t["rule_nodes"])))
+    t = tr[("Move", "Walk")]
+    n = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=t["node_guid"])
+    check(n and n.get("blend_mode") == "Custom" and n.get("blend_curve", "").endswith("CV_Blend") and len(t["rule_nodes"]) == 6,
+          "or condition, blend_curve implies Custom", n and (n.get("blend_mode"), n.get("blend_curve"), len(t["rule_nodes"])))
+    n = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=tr[("Walk", "Fall")]["node_guid"])
+    check(n and n["priority_order"] == 0 and abs(n["crossfade_duration"] - 0.1) < 1e-6, "transition node holds priority and crossfade", n and (n["priority_order"], n["crossfade_duration"]))
+    rg = [g for g in ok("AnimInspectToolset", "anim_list_graphs", blueprint_path=BP4)["graphs"] if g.get("owner_node_guid") == tr[("Idle", "Move")]["node_guid"]][0]
+    rn = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph=rg["graph_guid"])
+    calls = [x["title"] for x in rn["nodes"] if x["class"] == "K2Node_CallFunction"] if rn else []
+    check(len(calls) == 3 and any("AND" in x for x in calls) and any("NOT" in x for x in calls) and any(">" in x for x in calls),
+          "rule graph has >, NOT, AND", calls)
+
+    st = {s["name"]: s for s in r["states"]}
+    move = st["Move"]
+    check([(b["pin"], b["variable"]) for b in move.get("bindings", [])] == [("X", "Speed")], "Move binds X to Speed", move.get("bindings"))
+    p = ok("AnimInspectToolset", "anim_get_node", blueprint_path=BP4, node_guid=move["player_node_guid"])
+    xpin = pins_of(p).get("X", {}) if p else {}
+    check(p and p["class"] == "AnimGraphNode_BlendSpacePlayer" and [l["node_guid"] for l in xpin.get("linked_to", [])] == [move["bindings"][0]["getter_node_guid"]],
+          "blend space X pin is driven by the Speed getter", xpin.get("linked_to"))
+    walk_s = st["Walk"]
+    check([x["class"] for x in walk_s.get("nodes", [])] == ["AnimGraphNode_Slot", "AnimGraphNode_ModifyCurve"], "Walk extra nodes in order", walk_s.get("nodes"))
+    check(sorted((b["pin"], b["variable"]) for b in walk_s.get("bindings", [])) == [("Alpha", "Lean"), ("PlayRate", "Rate")],
+          "PlayRate (hidden by default) and ModifyCurve Alpha are bound", walk_s.get("bindings"))
+    g = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="Walk", include_pins=True)
+    if g:
+        by_class = {x["class"]: x for x in g["nodes"]}
+        slot_guid, mc_guid, player_guid = walk_s["nodes"][0]["node_guid"], walk_s["nodes"][1]["node_guid"], walk_s["player_node_guid"]
+        result_in = [p for p in by_class["AnimGraphNode_StateResult"]["pins"] if p["direction"] == "input"][0]
+        chain_ok = ([l["node_guid"] for l in result_in["linked_to"]] == [mc_guid]
+                    and [l["node_guid"] for l in pins_of(by_class["AnimGraphNode_ModifyCurve"])["SourcePose"]["linked_to"]] == [slot_guid]
+                    and [l["node_guid"] for l in pins_of(by_class["AnimGraphNode_Slot"])["Source"]["linked_to"]] == [player_guid])
+        check(chain_ok, "chain player -> Slot -> ModifyCurve -> Output Pose", sorted(by_class.keys()))
+        check("UpperBody" in by_class["AnimGraphNode_Slot"]["title"], "Slot name set through properties", by_class["AnimGraphNode_Slot"]["title"])
+        rate = pins_of(by_class["AnimGraphNode_SequencePlayer"]).get("PlayRate", {})
+        check(rate and not rate["hidden"] and rate["linked_to"], "PlayRate pin exposed and linked", rate.get("linked_to"))
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP4)
+    c and check(c["num_errors"] == 0, "compile spec with bindings, nodes and conditions", (c["num_errors"], c["num_warnings"], [m["message"][:80] for m in c["messages"]][:4]))
+
+    # anim_set_transition_rule with a combined condition
+    t = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition",
+           condition=json.dumps({"or": [{"bool": "bLadder"}, {"not": {"bool": "bFalling"}}]}))
+    t and check(t["rule"] == "condition" and len(t["rule_nodes"]) == 4, "anim_set_transition_rule condition", (t["rule"], len(t["rule_nodes"])))
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="bool_variable", variable_name="bFalling", condition='{"bool": "bFalling"}')
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition", condition="{nope")
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition")
+    expect_fail("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=tr[("Idle", "Fall")]["node_guid"], rule="condition", condition='{"and": [{"bool": "bFalling"}]}')
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path=BP4)
+    c and check(c["num_errors"] == 0, "compile after condition rule", c["num_errors"])
+
+# Atomic: every problem is listed and nothing is created.
+before = len(state_machines(BP4))
+bad5 = {"name": "Bad", "variables": [{"name": "bJump", "type": "bool"}],
+        "states": [{"name": "A", "animation": BS, "bind": {"Z": "Speed", "X": "bJump"}},
+                   {"name": "B", "nodes": [{"class": "NoSuchNode"}, {"class": "AnimGraphNode_Slot", "properties": {"Node.NoProp": "1"}}]},
+                   {"name": "C", "bind": {"X": "Speed"}}],
+        "transitions": [{"from": "A", "to": "B", "blend_mode": "Wobbly"},
+                        {"from": "B", "to": "A", "blend_mode": "Linear", "blend_curve": "/Game/AMCPTest/CV_Blend"},
+                        {"from": "A", "to": "*"},
+                        {"from": "A", "to": "C", "priority": 1.5, "rule": {"bool": "bJump", "not": {"bool": "bJump"}}},
+                        {"from": "B", "to": "C", "rule": {"and": [{"bool": "Missing"}, {"compare": "Speed", "comparison": ">"}]}}]}
+err = expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(bad5))
+want = ["no pin 'Z'", "bind 'X': variable 'bJump'", "NoSuchNode", "NoProp", "needs an 'animation'", "Wobbly", "only used with blend_mode 'Custom'",
+        "only 'from' may be '*'", "priority must be a whole number", "exactly one of", "'Missing'", "'compare' needs"]
+missing = [w for w in want if w not in err]
+check(not missing, "bad spec lists every problem", missing or err.count("\n- "))
+check(len(state_machines(BP4)) == before, "nothing created on bad spec", len(state_machines(BP4)))
+err = expect_fail("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps(
+    {"name": "Wild", "states": [{"name": "A"}, {"name": "B"}], "transitions": [{"from": "A", "to": "B"}, {"from": "*", "to": "B"}]}))
+check("expands to no transitions" in err, "wildcard that expands to nothing is rejected", err[:120])
+check(len(state_machines(BP4)) == before, "still nothing created", len(state_machines(BP4)))
+
+# --- v0.3 step 2: tools that replace or break links report every link they disconnected
+def links(lst):
+    return sorted((l["from_node_guid"], l["from_pin"], l["to_node_guid"], l["to_pin"]) for l in lst)
+
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="AnimGraph", include_pins=True)
+root4 = [n for n in r["nodes"] if n["class"] == "AnimGraphNode_Root"][0]
+loco4 = [n for n in r["nodes"] if n["class"] == "AnimGraphNode_StateMachine"][0]
+old_out = [(l["node_guid"], l["pin_name"]) for p in root4["pins"] if p["direction"] == "input" for l in p["linked_to"]]
+check(old_out and old_out[0][0] == loco4["node_guid"], "Loco drives the Output Pose before the rebuild", old_out)
+r = ok("AnimStateMachineToolset", "anim_build_state_machine", blueprint_path=BP4, spec=json.dumps({"name": "Loco2", "connect_to_output": True, "states": [{"name": "Idle", "animation": IDLE}]}))
+r and check(links(r["disconnected"]) == [(loco4["node_guid"], "Pose", root4["node_guid"], "Result")], "connect_to_output reports the replaced Output Pose link", r["disconnected"])
+
+p1 = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_SequencePlayer", x=-600, y=400)
+p2 = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_SequencePlayer", x=-600, y=600)
+bl = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path=BP4, graph="AnimGraph", node_class="AnimGraphNode_TwoWayBlend", x=-300, y=500)
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=p1["node_guid"], from_pin="Pose", to_node_guid=bl["node_guid"], to_pin="A")
+r and check(r["disconnected"] == [] and not r["replaced_existing_links"], "first connection disconnects nothing", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=p2["node_guid"], from_pin="Pose", to_node_guid=bl["node_guid"], to_pin="A")
+r and check(r["replaced_existing_links"] and links(r["disconnected"]) == [(p1["node_guid"], "Pose", bl["node_guid"], "A")],
+            "replacing a pose link names the old link", r["disconnected"])
+sm2 = state_machines(BP4)
+loco2 = [n for n in sm2 if n["state_machine_graph"] == "Loco2"][0]["node_guid"]
+r = ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path=BP4, from_node_guid=bl["node_guid"], from_pin="Pose", to_node_guid=root4["node_guid"], to_pin="Result")
+r and check(links(r["disconnected"]) == [(loco2, "Pose", root4["node_guid"], "Result")] and r["disconnected"][0]["to_node"],
+            "Output Pose link replaced by connect_pins is reported", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_disconnect_pins", blueprint_path=BP4, node_guid=bl["node_guid"], pin="A")
+r and check(r["links_broken"] == 1 and links(r["disconnected"]) == [(p2["node_guid"], "Pose", bl["node_guid"], "A")], "disconnect_pins lists the broken link", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_set_node_property", blueprint_path=BP4, node_guid=bl["node_guid"], property_path="Node.bAlwaysUpdateChildren", value="true")
+r and check(r["disconnected"] == [], "property change that keeps pins disconnects nothing", r["disconnected"])
+r = ok("AnimGraphEditToolset", "anim_remove_node", blueprint_path=BP4, node_guid=bl["node_guid"])
+r and check(links(r["disconnected"]) == [(bl["node_guid"], "Pose", root4["node_guid"], "Result")], "remove_node lists the links it broke", r["disconnected"])
+
+r = ok("AnimInspectToolset", "anim_list_nodes", blueprint_path=BP4, graph="Loco")
+loco_nodes = {n.get("state_name") or n.get("title"): n for n in r["nodes"]} if r else {}
+entry = [n for n in r["nodes"] if n["class"] == "AnimStateEntryNode"][0]["node_guid"]
+r = ok("AnimStateMachineToolset", "anim_add_state", blueprint_path=BP4, state_machine_guid=loco4["node_guid"], name="Start", x=0, y=600, set_as_entry=True)
+r and check(len(r["disconnected"]) == 1 and r["disconnected"][0]["from_node_guid"] == entry and r["disconnected"][0]["to_node_guid"] == loco_nodes["Idle"]["node_guid"],
+            "set_as_entry reports the previous Entry link", r["disconnected"])
+r = ok("AnimStateMachineToolset", "anim_set_state_animation", blueprint_path=BP4, state_guid=loco_nodes["Move"]["node_guid"], asset_path=WALK)
+if r:
+    removed = [n["class"] for n in r["removed_nodes"]]
+    gone = [(l["from_node"], l["from_pin"], l["to_pin"]) for l in r["disconnected"]]
+    check(removed == ["AnimGraphNode_BlendSpacePlayer"] and len(r["disconnected"]) == 2 and any(p == "X" for _, _, p in gone),
+          "set_state_animation reports the replaced player and the binding it orphaned", (removed, gone))
+fall_t = [n for n in loco_nodes.values() if n.get("from_state") == "Idle" and n.get("to_state") == "Fall"][0]["node_guid"]
+r = ok("AnimStateMachineToolset", "anim_set_transition_rule", blueprint_path=BP4, transition_guid=fall_t, rule="always")
+r and check(len(r["removed_nodes"]) == 4 and len(r["disconnected"]) == 4, "set_transition_rule reports the old rule's nodes and links",
+            ([n["title"] for n in r["removed_nodes"]], len(r["disconnected"])))
+r = ok("AnimStateMachineToolset", "anim_remove_state", blueprint_path=BP4, state_guid=loco_nodes["Fall"]["node_guid"])
+r and check(len(r["removed_transition_guids"]) == 3 and len(r["disconnected"]) == 6, "remove_state reports the transition links it broke",
+            (len(r["removed_transition_guids"]), len(r["disconnected"])))
+
+# --- v0.3 step 3: animation data, read-only
+def close(a, b, eps=1e-3):
+    return all(abs(x - y) <= eps for x, y in zip(a, b)) and len(a) == len(b)
+
+info = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WALK)
+if info:
+    log("walk info: length=%s fps=%s frames=%s keys=%s root_motion=%s curves=%d notifies=%d measured=%s" % (
+        info["length"], info["frame_rate"], info["frame_count"], info["key_count"], info["root_motion"], len(info["curves"]), len(info["notifies"]), info.get("bones_measured")))
+    check(info["length"] > 0 and info["frame_rate"] > 0 and abs(info["frame_count"] - info["length"] * info["frame_rate"]) < 1.01 and info["key_count"] == info["frame_count"] + 1,
+          "length, frame rate and frame count agree", (info["length"], info["frame_rate"], info["frame_count"], info["key_count"]))
+    check(info["class"] == "AnimSequence" and info["bone_track_count"] > 0 and info["skeleton"].endswith("TutorialTPP_Skeleton"), "class, skeleton and bone tracks", (info["class"], info["bone_track_count"]))
+    trav = {t["bone"].lower(): t for t in info.get("travel", [])}
+    check([b.lower() for b in info.get("bones_measured", [])] == ["root", "pelvis"] and set(trav) == {"root", "pelvis"}, "auto travel bones are root and pelvis", info.get("bones_measured"))
+    for bone, t in trav.items():
+        d = t["delta"]
+        consistent = (close([t["end"][i] - t["start"][i] for i in range(3)], [d["x"], d["y"], d["z"]])
+                      and abs(t["distance"] - (d["x"] ** 2 + d["y"] ** 2 + d["z"] ** 2) ** 0.5) < 1e-3
+                      and abs(t["horizontal_distance"] - (d["x"] ** 2 + d["y"] ** 2) ** 0.5) < 1e-3 and t["path_length"] >= t["distance"] - 1e-3)
+        check(consistent, "%s travel is self-consistent" % bone, (d, t["distance"], t["path_length"]))
+    s0 = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, bones="root,pelvis")
+    s1 = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=info["length"], bones="pelvis, root")
+    if s0 and s1:
+        b0 = {b["name"].lower(): b for b in s0["bones"]}
+        b1 = {b["name"].lower(): b for b in s1["bones"]}
+        check(close(b0["pelvis"]["translation"], trav["pelvis"]["start"]) and close(b1["pelvis"]["translation"], trav["pelvis"]["end"]),
+              "sampled pelvis at 0 and at the end matches the travel report", (b0["pelvis"]["translation"], trav["pelvis"]["start"], b1["pelvis"]["translation"], trav["pelvis"]["end"]))
+        check(s0["space"] == "component" and s0["frame"] == 0 and abs(s1["frame"] - info["frame_count"]) < 1e-3 and b0["pelvis"]["parent"].lower() == "root",
+              "sample reports space, frame and parent", (s0["space"], s0["frame"], s1["frame"], b0["pelvis"]["parent"]))
+        q = b0["pelvis"]["quaternion"]
+        check(abs(sum(x * x for x in q) - 1) < 1e-3 and len(b0["pelvis"]["rotation"]) == 3 and len(b0["pelvis"]["scale"]) == 3, "rotation is a unit quaternion plus euler angles", q)
+    mid = info["length"] / 2
+    pc = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="root,pelvis", space="component")
+    pp = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="root,pelvis", space="parent")
+    if pc and pp:
+        c = {b["name"].lower(): b for b in pc["bones"]}
+        p = {b["name"].lower(): b for b in pp["bones"]}
+        check(close(c["root"]["translation"], p["root"]["translation"]) and close(c["root"]["quaternion"], p["root"]["quaternion"]), "root: component space == parent space")
+        if close(c["root"]["translation"], [0, 0, 0]) and close(c["root"]["rotation"], [0, 0, 0]):
+            check(close(c["pelvis"]["translation"], p["pelvis"]["translation"]), "pelvis under an identity root: component == parent space")
+    al = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0)
+    bones_info = ok("AnimInspectToolset", "anim_list_skeleton_bones", asset_path=SK)
+    al and bones_info and check(len(al["bones"]) == len(bones_info["bones"]), "bones='*' samples every skeleton bone", (len(al["bones"]), len(bones_info["bones"])))
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=info["length"] + 1)
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, bones="root,no_such_bone")
+    expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=0, space="world")
+    expect_fail("AnimDataToolset", "anim_get_animation_info", asset_path=WALK, travel_bones="no_such_bone")
+r = ok("AnimDataToolset", "anim_get_animation_info", asset_path=IDLE, travel_bones="none")
+r and check("travel" not in r, "travel_bones='none' skips travel", sorted(r.keys()))
+r = ok("AnimDataToolset", "anim_get_animation_info", asset_path=IDLE, travel_bones="hand_r")
+r and check(r.get("bones_measured") == ["hand_r"], "explicit travel bone", r.get("bones_measured"))
+expect_fail("AnimDataToolset", "anim_get_animation_info", asset_path=BS)
+expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=BS, time=0)
+
+# --- v0.3 step 4: animation data editing (copies by default, curves, notifies, in-place travel, montages)
+CONTENT = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())
+def on_disk(path):
+    return os.path.exists(os.path.join(CONTENT, path[len("/Game/"):] + ".uasset"))
+
+err = expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]")
+check("explicit output_path" in err, "copy of an /Engine asset needs an explicit output_path", err[:100])
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]", in_place=True)
+WC = "/Game/AMCPTest/Walk_Curve"
+r = ok("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0], [0.5, 1], [1.0, 0.25]]", output_path=WC)
+if r:
+    check(r["path"].startswith(WC + ".") and not r["in_place"] and r["created"] and r["key_count"] == 3, "curve written to a new copy", (r["path"], r["created"], r["key_count"]))
+    check(not on_disk(WC), "the copy is not saved to disk", WC)
+    src = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WALK, travel_bones="none")
+    cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+    src and check(src["curves"] == [], "source animation untouched", src["curves"])
+    cp and check([(c["name"], c["key_count"], round(c["min_value"], 3), round(c["max_value"], 3)) for c in cp["curves"]] == [("Lean", 3, 0, 1)], "copy has the curve", cp["curves"])
+err = expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]", output_path=WC)
+check("already exists" in err, "name collision rejected", err[:80])
+r = ok("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys='[{"time": 0, "value": 2}, {"time": 1.5, "value": 3}]', interpolation="linear", in_place=True)
+r and check(r["in_place"] and not r["created"] and r["key_count"] == 2, "in_place replaces keys of an existing curve", (r["in_place"], r["created"]))
+cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+cp and check([(c["name"], c["key_count"], round(c["min_value"], 3), round(c["max_value"], 3)) for c in cp["curves"]] == [("Lean", 2, 2, 3)], "replaced keys read back", cp["curves"])
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1], [0, 2]]", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[99, 1]]", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1]]", interpolation="bezier", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1]]", in_place=True, output_path="/Game/AMCPTest/X")
+r = ok("AnimDataToolset", "anim_remove_curve", animation_path=WC, curve_name="Lean", in_place=True)
+cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+cp and check(cp["curves"] == [], "curve removed", cp["curves"])
+expect_fail("AnimDataToolset", "anim_remove_curve", animation_path=WC, curve_name="Lean", in_place=True)
+
+# Notifies
+fr = cp["frame_rate"] if cp else 30
+n1 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="Footstep_L", frame=10, track="Feet", in_place=True)
+n2 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="none", time=0.5, notify_class="AnimNotify_PlaySound", in_place=True)
+n3 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="Trail", time=0.2, notify_class="AnimNotifyState_Trail", duration=0.3, track="FX", in_place=True)
+if n1 and n2 and n3:
+    a, b, c = n1["notify"], n2["notify"], n3["notify"]
+    check(a["name"] == "Footstep_L" and abs(a["time"] - 10 / fr) < 1e-4 and abs(a["frame"] - 10) < 1e-3 and a["track"] == "Feet" and a["class"] == "" and a["guid"].count("-") == 4,
+          "named notify at frame 10 on track Feet", a)
+    check(b["class"].endswith("AnimNotify_PlaySound") and not b["is_state"] and b["track"] == "1", "class notify on default track", b)
+    check(c["is_state"] and abs(c["duration"] - 0.3) < 1e-4 and c["name"] == "Trail" and c["track"] == "FX", "notify state with duration", c)
+    info = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+    info and check(sorted(n["guid"] for n in info["notifies"]) == sorted([a["guid"], b["guid"], c["guid"]]) and {"Feet", "FX", "1"} <= set(info["notify_tracks"]),
+                   "info lists the notifies and tracks", (len(info["notifies"]), info["notify_tracks"]))
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], name="Footstep_R", frame=20, track="Hands", in_place=True)
+    u and check(u["notify"]["guid"] == a["guid"] and u["notify"]["name"] == "Footstep_R" and abs(u["notify"]["frame"] - 20) < 1e-3 and u["notify"]["track"] == "Hands",
+                "update renames, moves and re-tracks by guid", u["notify"])
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=c["guid"], duration=0.5, in_place=True)
+    u and check(abs(u["notify"]["duration"] - 0.5) < 1e-4 and abs(u["notify"]["time"] - 0.2) < 1e-4, "update a state's duration keeps its time", u["notify"])
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], duration=0.5, in_place=True)
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], in_place=True)
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify="index:99", name="X", in_place=True)
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify="index:0", name="First", in_place=True)
+    u and check(u["notify"]["name"] == "First", "update by index", u["notify"]["name"])
+    # A copy of a /Game animation gets the automatic name and keeps the notify guids.
+    cpy = ok("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify=b["guid"])
+    if cpy:
+        check(cpy["path"].startswith(WC + "_Edited.") and cpy["removed"]["guid"] == b["guid"], "remove on an automatic copy", cpy["path"])
+        i1 = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+        i2 = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC + "_Edited", travel_bones="none")
+        i1 and i2 and check(len(i1["notifies"]) == 3 and len(i2["notifies"]) == 2 and b["guid"] not in [n["guid"] for n in i2["notifies"]],
+                            "copy lost the notify, the original kept it", (len(i1["notifies"]), len(i2["notifies"])))
+    expect_fail("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify=b["guid"])  # WC_Edited exists now
+    expect_fail("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify="00000000-0000-0000-0000-000000000001", in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, frame=3, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=99, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="none", time=0.1, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, notify_class="AnimNotifyState_Trail", in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, duration=1, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, notify_class="NoSuchNotify", in_place=True)
+
+# In-place travel: inject a known forward drift into the pelvis of a copy, then remove it.
+WT = "/Game/AMCPTest/Walk_Travel"
+ok("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Tmp", keys="[[0, 0]]", output_path=WT)
+wi = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+seq = unreal.load_asset(WT)
+if wi and seq:
+    nkeys = wi["key_count"]
+    pos, rot, scl = [], [], []
+    for k in range(nkeys):
+        s = ok("AnimDataToolset", "anim_sample_bones", asset_path=WT, time=k / wi["frame_rate"], bones="pelvis", space="parent")["bones"][0]
+        t = k / (nkeys - 1)
+        pos.append(unreal.Vector(s["translation"][0] + 60 * t, s["translation"][1] + 120 * t, s["translation"][2]))
+        rot.append(unreal.Quat(*s["quaternion"]))
+        scl.append(unreal.Vector(*s["scale"]))
+    seq.get_editor_property("controller").set_bone_track_keys("pelvis", pos, rot, scl, True)
+    wi = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+    pt = {t["bone"].lower(): t for t in wi["travel"]}["pelvis"]
+    check(abs(pt["delta"]["x"] - 60) < 0.01 and abs(pt["delta"]["y"] - 120) < 0.01 and abs(pt["delta"]["z"]) < 0.01, "test drift injected into the pelvis", pt["delta"])
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT)
+    if r:
+        check(r["bone"] == "pelvis" and "hips" in r["reason"] and r["path"].startswith(WT + "_Edited.") and r["keys_changed"] == nkeys,
+              "auto picks the hips (root does not move) and writes a copy", (r["bone"], r["reason"], r["path"]))
+        check(abs(r["before"]["delta"]["y"] - 120) < 0.01 and abs(r["after"]["delta"]["x"]) < 0.01 and abs(r["after"]["delta"]["y"]) < 0.01,
+              "xy drift removed", (r["before"]["delta"], r["after"]["delta"]))
+        mid = (nkeys // 2) / wi["frame_rate"]
+        o = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="pelvis")
+        e = ok("AnimDataToolset", "anim_sample_bones", asset_path=WT + "_Edited", time=mid, bones="pelvis")
+        o and e and check(close(o["bones"][0]["translation"], e["bones"][0]["translation"], 0.01) and close(o["bones"][0]["quaternion"], e["bones"][0]["quaternion"], 1e-4),
+                          "sway and rotation kept: mid-frame pelvis matches the original walk", (o["bones"][0]["translation"], e["bones"][0]["translation"]))
+        src = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+        src and check(abs({t["bone"].lower(): t for t in src["travel"]}["pelvis"]["delta"]["y"] - 120) < 0.01, "source keeps its travel")
+        err = expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT + "_Edited", in_place=True)
+        check("nothing to remove" in err, "already in place is reported, not silently re-saved", err[:90])
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="pelvis", axes="z", mode="flatten", output_path="/Game/AMCPTest/Walk_FlatZ")
+    if r:
+        zs = [ok("AnimDataToolset", "anim_sample_bones", asset_path="/Game/AMCPTest/Walk_FlatZ", time=t, bones="pelvis")["bones"][0]["translation"][2] for t in (0, wi["length"] / 3, wi["length"] / 2)]
+        check(max(zs) - min(zs) < 0.01 and abs(r["after"]["delta"]["y"] - 120) < 0.01, "flatten z holds the first frame and leaves x/y alone", (zs, r["after"]["delta"]))
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="pelvis", axes="xy", in_place=True)
+    r and check(r["in_place"] and abs(r["after"]["delta"]["y"]) < 0.01, "in_place edit of a /Game animation", r["after"]["delta"])
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WALK, in_place=True)
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, axes="q", output_path="/Game/AMCPTest/Nope1")
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, mode="wobble", output_path="/Game/AMCPTest/Nope2")
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="no_such_bone", output_path="/Game/AMCPTest/Nope3")
+check(not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/Nope1") and not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/Nope3"), "rejected edits create no copy")
+
+# Montages. The slot name is one no Slot node uses: compiling an Animation Blueprint registers its Slot nodes' names on the skeleton.
+r = ok("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Walk", animation_path=WALK, slot_name="AMCP_MontageOnly",
+       sections=json.dumps([{"name": "Start", "time": 0}, {"name": "Loop", "time": 0.5, "next": "Loop"}, {"name": "End", "time": 1.2}]))
+if r:
+    check([(s["name"], round(s["time"], 3), s["next"]) for s in r["sections"]] == [("Start", 0, "Loop"), ("Loop", 0.5, "Loop"), ("End", 1.2, "")],
+          "montage sections and links", r["sections"])
+    check(r["slot_name"] == "AMCP_MontageOnly" and not r["slot_on_skeleton"] and len(r["warnings"]) == 1 and abs(r["length"] - wi["length"]) < 1e-3 and not on_disk("/Game/AMCPTest/AM_Walk"),
+          "montage slot, length, unregistered-slot warning, not saved", (r["slot_name"], r["length"], r["warnings"]))
+    m = unreal.load_asset("/Game/AMCPTest/AM_Walk")
+    check(m and str(m.get_editor_property("slot_anim_tracks")[0].get_editor_property("slot_name")) == "AMCP_MontageOnly", "slot name stored on the asset")
+    mi = ok("AnimDataToolset", "anim_get_animation_info", asset_path="/Game/AMCPTest/AM_Walk")
+    mi and check(mi["class"] == "AnimMontage" and "travel" not in mi, "info on a montage", mi["class"])
+    n = ok("AnimDataToolset", "anim_add_notify", animation_path="/Game/AMCPTest/AM_Walk", name="Hit", time=0.6, in_place=True)
+    n and check(n["notify"]["name"] == "Hit", "notify on a montage", n["notify"])
+r = ok("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Default", animation_path=WALK, sections='[{"name": "Mid", "time": 0.5, "next": ""}]')
+r and check([(s["name"], s["next"]) for s in r["sections"]] == [("Default", "Mid"), ("Mid", "")] and r["slot_on_skeleton"] and r["warnings"] == [],
+            "Default section added at 0, DefaultSlot is on the skeleton", r["sections"])
+err = expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Bad", animation_path=WALK,
+                  sections=json.dumps([{"name": "A", "time": 0}, {"name": "A", "time": 0.2}, {"name": "B", "time": 99, "next": "Nope"}, {"name": "C", "time": 0.3, "colour": 1}]))
+check(all(w in err for w in ["used twice", "outside the animation", "'Nope' is not in the list", "unknown field 'colour'"]) and not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/AM_Bad"),
+      "bad sections listed, nothing created", err[:200])
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Walk", animation_path=WALK)
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Engine/X", asset_name="AM_X", animation_path=WALK)
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_BS", animation_path=BS)
+
+# Undo: each in-place edit is one transaction, and the data model is restored with it.
+def skip(what):
+    log("SKIP %s: no undo buffer in this mode (run with -ExecutePythonScript to include it)" % what)
+
+def curve_names(path):
+    i = ok("AnimDataToolset", "anim_get_animation_info", asset_path=path, travel_bones="none")
+    return [c["name"] for c in i["curves"]] if i else None
+def undo():
+    unreal.SystemLibrary.execute_console_command(None, "TRANSACTION UNDO")
+if TRANSACTIONS:
+    ok("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="UndoMe", keys="[[0, 1], [1, 2]]", in_place=True)
+    had = curve_names(WC)
+    undo()
+    check(had and "UndoMe" in had and "UndoMe" not in (curve_names(WC) or ["?"]), "undo removes an in-place curve edit", (had, curve_names(WC)))
+    nb = len(ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")["notifies"])
+    ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="UndoNotify", time=0.1, in_place=True)
+    undo()
+    na = len(ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")["notifies"])
+    check(na == nb, "undo removes an added notify", (nb, na))
+    tb = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT + "_Edited")
+    ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT + "_Edited", bone="pelvis", axes="z", mode="flatten", in_place=True)
+    undo()
+    ta = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT + "_Edited")
+    pz = lambda i: {t["bone"].lower(): t for t in i["travel"]}["pelvis"]["path_length"]
+    tb and ta and check(abs(pz(tb) - pz(ta)) < 1e-3, "undo restores bone keys", (pz(tb), pz(ta)))
+else:
+    skip("undo of curve, notify and bone key edits")
+
+# --- v0.3 step 5: rename and reparent Animation Blueprints
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Ren", skeleton_path=SK)
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_RenChild", skeleton_path=SK, parent_class="/Game/AMCPTest/ABP_Ren")
+ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Ren")
+ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_RenChild")
+# Referencers come from the asset registry. The editor's file watcher would pick up the saved files; headless, rescan them.
+unreal.AssetRegistryHelpers.get_asset_registry().scan_paths_synchronous(["/Game/AMCPTest"], True)
+r = ok("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Ren", new_name="ABP_Renamed")
+if r:
+    check(r["new_path"] == "/Game/AMCPTest/ABP_Renamed.ABP_Renamed" and r["redirector"] == "/Game/AMCPTest/ABP_Ren.ABP_Ren" and r["compile"]["num_errors"] == 0 and not r["saved"],
+          "rename moves the blueprint, leaves a redirector and compiles", (r["new_path"], r["compile"]["status"]))
+    check("/Game/AMCPTest/ABP_RenChild" in r["referencers"], "rename lists the blueprints that reference it", r["referencers"])
+    check(r["save_to_finish"] == ["/Game/AMCPTest/ABP_Renamed", "/Game/AMCPTest/ABP_Ren"], "rename says what to save", r["save_to_finish"])
+    check(not on_disk("/Game/AMCPTest/ABP_Renamed") and on_disk("/Game/AMCPTest/ABP_Ren"), "nothing saved, old file not deleted")
+    c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_RenChild")
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_RenChild")
+    c and i and check(c["num_errors"] == 0 and "ABP_Renamed" in i["parent_class"], "child of the renamed blueprint still compiles and follows it", (c["num_errors"], i["parent_class"]))
+    ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Renamed")
+    ok("AnimAssetToolset", "anim_save_asset", asset_path="/Game/AMCPTest/ABP_Ren")
+    check(on_disk("/Game/AMCPTest/ABP_Renamed") and on_disk("/Game/AMCPTest/ABP_Ren"), "saving the new path and the redirector finishes the rename")
+r = ok("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Renamed", new_name="ABP_Moved", new_folder="/Game/AMCPTest/Sub/")
+r and check(r["new_path"] == "/Game/AMCPTest/Sub/ABP_Moved.ABP_Moved", "rename into another folder", r["new_path"])
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="ABP_Test", new_folder="/Game/AMCPTest")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="ABP_X", new_folder="/Engine/X")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Game/AMCPTest/Sub/ABP_Moved", new_name="Bad Name!")
+expect_fail("AnimAssetToolset", "anim_rename_anim_blueprint", blueprint_path="/Engine/Tutorial/SubEditors/TutorialAssets/Character/TutorialTPP_AnimBlueprint", new_name="X")
+
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Base", skeleton_path=SK)
+ok("AnimAssetToolset", "anim_add_variable", blueprint_path="/Game/AMCPTest/ABP_Base", name="BaseSpeed", type="float")
+ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base")
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_Kid", skeleton_path=SK, parent_class="/Game/AMCPTest/ABP_Base")
+g = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph", node_class="K2Node_VariableGet", variable_name="BaseSpeed")
+gs = ok("AnimGraphEditToolset", "anim_add_node", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph", node_class="K2Node_CallFunction", function_name="KismetSystemLibrary.PrintString", x=300)
+ev = [n for n in ok("AnimInspectToolset", "anim_list_nodes", blueprint_path="/Game/AMCPTest/ABP_Kid", graph="EventGraph")["nodes"] if n["class"] == "K2Node_Event"]
+log("kid event graph: events=%s" % [(n["title"], n["node_guid"]) for n in ev])
+if g and gs and ev:
+    ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path="/Game/AMCPTest/ABP_Kid", from_node_guid=ev[0]["node_guid"], from_pin="then", to_node_guid=gs["node_guid"], to_pin="execute")
+    ok("AnimGraphEditToolset", "anim_connect_pins", blueprint_path="/Game/AMCPTest/ABP_Kid", from_node_guid=g["node_guid"], from_pin="BaseSpeed", to_node_guid=gs["node_guid"], to_pin="InString")
+c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid")
+c and check(c["num_errors"] == 0, "child reading an inherited variable compiles", (c["num_errors"], [m["message"][:80] for m in c["messages"]]))
+r = ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="AnimInstance")
+if r:
+    log("reparent report: new_errors=%s fixed=%s" % ([(m["message"][:90], (m.get("source") or {}).get("node_guid")) for m in r["new_errors"]], len(r["fixed"])))
+    check(r["broke"] and r["new_errors"] and r["new_parent"].endswith("AnimInstance") and "ABP_Base" in r["old_parent"], "reparent reports what broke", (r["broke"], len(r["new_errors"])))
+    check(any("Base Speed" in m["message"] or "BaseSpeed" in m["message"] for m in r["new_errors"]) and any((m.get("source") or {}).get("node_guid") == g["node_guid"] for m in r["new_errors"]),
+          "the new error names the variable and points at the getter node", [m["message"][:90] for m in r["new_errors"]])
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_Kid")
+    i and check(i["parent_class"].endswith("AnimInstance"), "parent class changed", i["parent_class"])
+r = ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_Base")
+r and check(not r["broke"] and r["compile"]["num_errors"] == 0 and len(r["fixed"]) >= 1 and r["new_errors"] == [], "reparenting back fixes it and says so", (r["compile"]["num_errors"], len(r["fixed"])))
+if TRANSACTIONS:
+    ok("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="AnimInstance")
+    undo()
+    i = ok("AnimInspectToolset", "anim_get_blueprint_info", blueprint_path="/Game/AMCPTest/ABP_Kid")
+    i and check("ABP_Base" in i["parent_class"], "undo restores the parent", i["parent_class"])
+else:
+    skip("undo of reparent")
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_Base")
+# Regression: right after the undo above, ABP_Kid's compiled class still derives from AnimInstance; the cycle must still be caught.
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base", new_parent="/Game/AMCPTest/ABP_Kid")
+c = ok("AnimAssetToolset", "anim_compile_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid")
+c and check(c["num_errors"] == 0, "child compiles after the reparent round trip", c["num_errors"])
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Base", new_parent="/Game/AMCPTest/ABP_Base")
+expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="Actor")
+ok("AnimAssetToolset", "anim_create_anim_blueprint", folder="/Game/AMCPTest", asset_name="ABP_OtherSkel", skeleton_path=SK_COPY)
+err = expect_fail("AnimAssetToolset", "anim_reparent_anim_blueprint", blueprint_path="/Game/AMCPTest/ABP_Kid", new_parent="/Game/AMCPTest/ABP_OtherSkel")
+check("not compatible" in err, "parent with an incompatible skeleton is rejected", err[:100])
+
 fails = [l for l in LOG if l.startswith("FAIL")]
-log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))
+log("SUMMARY: %d checks, %d failures, %d skipped (%s)" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails),
+    len([l for l in LOG if l.startswith("SKIP")]), "full editor" if TRANSACTIONS else "commandlet"))
+OUT.close()
+if TRANSACTIONS:
+    unreal.SystemLibrary.quit_editor()

@@ -9,11 +9,6 @@
 #include "Animation/Skeleton.h"
 #include "AnimGraphNode_AssetPlayerBase.h"
 #include "AnimGraphNode_Base.h"
-#include "AnimGraphNode_CustomTransitionResult.h"
-#include "AnimGraphNode_Root.h"
-#include "AnimGraphNode_StateResult.h"
-#include "AnimGraphNode_TransitionResult.h"
-#include "AnimStateEntryNode.h"
 #include "AnimStateNodeBase.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphSchema.h"
@@ -21,61 +16,12 @@
 #include "K2Node_CallFunction.h"
 #include "K2Node_Variable.h"
 #include "Kismet2/BlueprintEditorUtils.h"
-#include "Misc/StringOutputDevice.h"
 #include "ScopedTransaction.h"
 
 #define LOCTEXT_NAMESPACE "AnimMCPGraphEdit"
 
 namespace
 {
-	UClass* ResolveNodeClass(const FString& Name, FString& OutError)
-	{
-		const FString Trimmed = Name.TrimStartAndEnd();
-		UClass* Class = nullptr;
-		if (Trimmed.StartsWith(TEXT("/")))
-		{
-			Class = FindObject<UClass>(nullptr, *Trimmed);
-			if (!Class)
-			{
-				Class = LoadObject<UClass>(nullptr, *Trimmed);
-			}
-		}
-		else
-		{
-			Class = FindFirstObject<UClass>(*Trimmed, EFindFirstObjectOptions::NativeFirst);
-			if (!Class && Trimmed.StartsWith(TEXT("U")))
-			{
-				Class = FindFirstObject<UClass>(*Trimmed.RightChop(1), EFindFirstObjectOptions::NativeFirst);
-			}
-		}
-
-		if (!Class || !Class->IsChildOf(UEdGraphNode::StaticClass()))
-		{
-			OutError = FString::Printf(TEXT("'%s' is not a graph node class. Use anim_list_node_types to see valid anim node classes."), *Name);
-			return nullptr;
-		}
-		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
-		{
-			OutError = FString::Printf(TEXT("'%s' is abstract or deprecated and cannot be placed."), *Name);
-			return nullptr;
-		}
-		if (Class->IsChildOf(UAnimGraphNode_Root::StaticClass())
-			|| Class->IsChildOf(UAnimGraphNode_StateResult::StaticClass())
-			|| Class->IsChildOf(UAnimGraphNode_TransitionResult::StaticClass())
-			|| Class->IsChildOf(UAnimGraphNode_CustomTransitionResult::StaticClass())
-			|| Class->IsChildOf(UAnimStateEntryNode::StaticClass()))
-		{
-			OutError = FString::Printf(TEXT("'%s' is a result/entry node that the editor creates automatically; it cannot be added manually."), *Name);
-			return nullptr;
-		}
-		if (Class->IsChildOf(UAnimStateNodeBase::StaticClass()))
-		{
-			OutError = TEXT("States, conduits and transitions must be created with anim_add_state, anim_add_conduit and anim_add_transition.");
-			return nullptr;
-		}
-		return Class;
-	}
-
 	UFunction* ResolveFunction(UBlueprint* Blueprint, const FString& FunctionName, FString& OutError)
 	{
 		FString ClassName;
@@ -130,113 +76,6 @@ namespace
 			|| Category == UEdGraphSchema_K2::PC_SoftClass
 			|| Category == UEdGraphSchema_K2::PC_Interface;
 	}
-
-	struct FResolvedProperty
-	{
-		FProperty* TopProperty = nullptr;
-		FProperty* LeafProperty = nullptr;
-		void* LeafValue = nullptr;
-	};
-
-	/** Walks 'A.B[2].C' from Object down to the leaf value. Every segment must be editor-visible. */
-	bool ResolvePropertyPath(UObject* Object, const FString& Path, FResolvedProperty& Out, FString& OutError)
-	{
-		TArray<FString> Segments;
-		Path.ParseIntoArray(Segments, TEXT("."));
-		if (Segments.IsEmpty())
-		{
-			OutError = TEXT("property_path is empty.");
-			return false;
-		}
-
-		UStruct* Struct = Object->GetClass();
-		void* Container = Object;
-		for (int32 Index = 0; Index < Segments.Num(); ++Index)
-		{
-			FString Name = Segments[Index];
-			int32 ArrayIndex = INDEX_NONE;
-			int32 BracketPos;
-			if (Name.FindChar(TEXT('['), BracketPos) && Name.EndsWith(TEXT("]")))
-			{
-				const FString IndexText = Name.Mid(BracketPos + 1, Name.Len() - BracketPos - 2);
-				if (!IndexText.IsNumeric())
-				{
-					OutError = FString::Printf(TEXT("Invalid array index in '%s'."), *Segments[Index]);
-					return false;
-				}
-				ArrayIndex = FCString::Atoi(*IndexText);
-				Name.LeftInline(BracketPos);
-			}
-
-			FProperty* Property = FindFProperty<FProperty>(Struct, FName(*Name));
-			if (!Property && Index == 0 && Name == TEXT("Node"))
-			{
-				if (const UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Object))
-				{
-					Property = AnimNode->GetFNodeProperty();
-				}
-			}
-			if (!Property)
-			{
-				TArray<FString> Available;
-				for (TFieldIterator<FProperty> It(Struct); It; ++It)
-				{
-					if (It->HasAnyPropertyFlags(CPF_Edit))
-					{
-						Available.Add(It->GetName());
-					}
-				}
-				OutError = FString::Printf(TEXT("Property '%s' not found on %s. Editable properties: %s"),
-					*Name, *Struct->GetName(), *FString::Join(Available, TEXT(", ")));
-				return false;
-			}
-			if (!Property->HasAnyPropertyFlags(CPF_Edit) || Property->HasAnyPropertyFlags(CPF_EditConst))
-			{
-				OutError = FString::Printf(TEXT("Property '%s' is not editable."), *Name);
-				return false;
-			}
-			if (Index == 0)
-			{
-				Out.TopProperty = Property;
-			}
-
-			void* Value = Property->ContainerPtrToValuePtr<void>(Container);
-			if (ArrayIndex != INDEX_NONE)
-			{
-				FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property);
-				if (!ArrayProperty)
-				{
-					OutError = FString::Printf(TEXT("'%s' is not an array."), *Name);
-					return false;
-				}
-				FScriptArrayHelper Helper(ArrayProperty, Value);
-				if (!Helper.IsValidIndex(ArrayIndex))
-				{
-					OutError = FString::Printf(TEXT("Index %d out of range for '%s' (size %d)."), ArrayIndex, *Name, Helper.Num());
-					return false;
-				}
-				Value = Helper.GetRawPtr(ArrayIndex);
-				Property = ArrayProperty->Inner;
-			}
-
-			if (Index == Segments.Num() - 1)
-			{
-				Out.LeafProperty = Property;
-				Out.LeafValue = Value;
-				return true;
-			}
-
-			FStructProperty* StructProperty = CastField<FStructProperty>(Property);
-			if (!StructProperty)
-			{
-				OutError = FString::Printf(TEXT("'%s' is not a struct, so '%s' cannot be resolved inside it."), *Name, *Segments[Index + 1]);
-				return false;
-			}
-			Struct = StructProperty->Struct;
-			Container = Value;
-		}
-		return false;
-	}
 }
 
 FAnimMCPResult UAnimGraphEditToolset::anim_add_node(const FString& blueprint_path, const FString& graph, const FString& node_class, float x, float y, const FString& variable_name, const FString& function_name)
@@ -254,7 +93,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_add_node(const FString& blueprint_pat
 	{
 		return AnimMCP::Fail(Error);
 	}
-	UClass* NodeClass = ResolveNodeClass(node_class, Error);
+	UClass* NodeClass = AnimMCP::ResolveNodeClass(node_class, Error);
 	if (!NodeClass)
 	{
 		return AnimMCP::Fail(Error);
@@ -335,12 +174,14 @@ FAnimMCPResult UAnimGraphEditToolset::anim_remove_node(const FString& blueprint_
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("RemoveNode", "AnimMCP: Remove Node"));
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 	AnimBP->Modify();
 	AnimMCP::RemoveNode(AnimBP, Node);
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(AnimBP);
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("removed_node_guid"), node_guid);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 
@@ -417,6 +258,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_connect_pins(const FString& blueprint
 	}
 
 	const FScopedTransaction Transaction(LOCTEXT("ConnectPins", "AnimMCP: Connect Pins"));
+	const AnimMCP::FLinkTracker Tracker({ FromNode->GetGraph() });
 	FromNode->Modify();
 	ToNode->Modify();
 	for (UEdGraphPin* Linked : ToPin->LinkedTo)
@@ -435,10 +277,11 @@ FAnimMCPResult UAnimGraphEditToolset::anim_connect_pins(const FString& blueprint
 	}
 	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
 
+	const TArray<TSharedPtr<FJsonValue>> Disconnected = Tracker.Disconnected();
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetBoolField(TEXT("connected"), true);
-	Payload->SetBoolField(TEXT("replaced_existing_links"),
-		Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_A || Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_B || Response.Response == CONNECT_RESPONSE_BREAK_OTHERS_AB);
+	Payload->SetBoolField(TEXT("replaced_existing_links"), !Disconnected.IsEmpty());
+	Payload->SetArrayField(TEXT("disconnected"), Disconnected);
 	Payload->SetStringField(TEXT("message"), Response.Message.ToString());
 	return AnimMCP::Ok(Payload);
 }
@@ -465,7 +308,7 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 	}
 
 	const UEdGraphSchema* Schema = Node->GetGraph()->GetSchema();
-	int32 LinksBroken = 0;
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 
 	if (AnimMCP::IsUnset(to_node_guid))
 	{
@@ -480,7 +323,6 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 		{
 			Linked->GetOwningNode()->Modify();
 		}
-		LinksBroken = Pin->LinkedTo.Num();
 		Schema->BreakPinLinks(*Pin, /*bSendsNodeNotifcation*/ true);
 	}
 	else
@@ -508,12 +350,13 @@ FAnimMCPResult UAnimGraphEditToolset::anim_disconnect_pins(const FString& bluepr
 		Node->Modify();
 		OtherNode->Modify();
 		Schema->BreakSinglePinLink(Pin, OtherPin);
-		LinksBroken = 1;
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
+	const TArray<TSharedPtr<FJsonValue>> Disconnected = Tracker.Disconnected();
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetNumberField(TEXT("links_broken"), LinksBroken);
+	Payload->SetNumberField(TEXT("links_broken"), Disconnected.Num());
+	Payload->SetArrayField(TEXT("disconnected"), Disconnected);
 	return AnimMCP::Ok(Payload);
 }
 
@@ -618,46 +461,25 @@ FAnimMCPResult UAnimGraphEditToolset::anim_set_node_property(const FString& blue
 		return AnimMCP::Fail(Error);
 	}
 
-	FResolvedProperty Resolved;
-	if (!ResolvePropertyPath(Node, property_path, Resolved, Error))
+	if (!AnimMCP::CanImportPropertyValue(Node, property_path, value, Error))
 	{
 		return AnimMCP::Fail(Error);
 	}
 
-	// Import into a scratch copy first so a bad value never touches the node.
-	FStringOutputDevice ImportErrors;
-	void* Scratch = FMemory::Malloc(Resolved.LeafProperty->GetElementSize(), Resolved.LeafProperty->GetMinAlignment());
-	Resolved.LeafProperty->InitializeValue(Scratch);
-	Resolved.LeafProperty->CopySingleValue(Scratch, Resolved.LeafValue);
-	const TCHAR* ImportResult = Resolved.LeafProperty->ImportText_Direct(*value, Scratch, Node, PPF_None, &ImportErrors);
-	Resolved.LeafProperty->DestroyValue(Scratch);
-	FMemory::Free(Scratch);
-	if (!ImportResult || !ImportErrors.IsEmpty())
-	{
-		return AnimMCP::Fail(FString::Printf(TEXT("Could not parse '%s' for %s (%s). %s"),
-			*value, *property_path, *Resolved.LeafProperty->GetCPPType(), *ImportErrors));
-	}
-
 	const FScopedTransaction Transaction(LOCTEXT("SetNodeProperty", "AnimMCP: Set Node Property"));
-	Node->Modify();
-	Node->PreEditChange(Resolved.TopProperty);
-	Resolved.LeafProperty->ImportText_Direct(*value, Resolved.LeafValue, Node, PPF_None);
-	FPropertyChangedEvent ChangedEvent(Resolved.TopProperty, EPropertyChangeType::ValueSet);
-	Node->PostEditChangeProperty(ChangedEvent);
-	Node->ReconstructNode();
-	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
-
-	// Re-resolve: ReconstructNode may have reallocated storage.
+	const AnimMCP::FLinkTracker Tracker({ Node->GetGraph() });
 	FString ReadBack;
-	if (ResolvePropertyPath(Node, property_path, Resolved, Error))
+	if (!AnimMCP::SetNodePropertyByPath(Node, property_path, value, ReadBack, Error))
 	{
-		Resolved.LeafProperty->ExportTextItem_Direct(ReadBack, Resolved.LeafValue, nullptr, Node, PPF_None);
+		return AnimMCP::Fail(Error);
 	}
+	FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("node_guid"), node_guid);
 	Payload->SetStringField(TEXT("property_path"), property_path);
 	Payload->SetStringField(TEXT("value"), ReadBack);
+	Payload->SetArrayField(TEXT("disconnected"), Tracker.Disconnected());
 	return AnimMCP::Ok(Payload);
 }
 

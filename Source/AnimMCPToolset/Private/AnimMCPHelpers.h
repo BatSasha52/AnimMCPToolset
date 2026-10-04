@@ -126,6 +126,74 @@ namespace AnimMCP
 	/** Gets the blueprint that owns the graph the node lives in. */
 	UBlueprint* GetOwningBlueprint(const UEdGraphNode* Node);
 
+	/**
+	 * Resolves a node class name ('AnimGraphNode_Slot', 'K2Node_VariableGet' or a full class path) to a class that
+	 * can be placed by hand. Result/entry nodes and state machine states/transitions are rejected.
+	 */
+	UClass* ResolveNodeClass(const FString& Name, FString& OutError);
+
+	/**
+	 * Records every link (and node) in some graphs before an edit, so the tool can report exactly what the edit
+	 * disconnected or removed. Links are identified by node GUID and pin name on both ends.
+	 */
+	class FLinkTracker
+	{
+	public:
+		explicit FLinkTracker(TArray<const UEdGraph*> InGraphs);
+
+		/** Links that existed when the tracker was created and are gone now: [{from_node_guid, from_node, from_pin, to_node_guid, to_node, to_pin}]. */
+		TArray<TSharedPtr<FJsonValue>> Disconnected() const;
+
+		/** Nodes that existed when the tracker was created and are gone now: [{node_guid, title, class}]. */
+		TArray<TSharedPtr<FJsonValue>> RemovedNodes() const;
+
+	private:
+		struct FLink
+		{
+			FGuid FromNode;
+			FName FromPin;
+			FGuid ToNode;
+			FName ToPin;
+			FString FromTitle;
+			FString ToTitle;
+		};
+		struct FNodeRecord
+		{
+			FGuid Guid;
+			FString Title;
+			FString Class;
+		};
+		static void Collect(const TArray<TWeakObjectPtr<const UEdGraph>>& Graphs, TArray<FLink>& OutLinks, TArray<FNodeRecord>& OutNodes);
+
+		TArray<TWeakObjectPtr<const UEdGraph>> Graphs;
+		TArray<FLink> Links;
+		TArray<FNodeRecord> Nodes;
+	};
+
+	// ---- Properties ------------------------------------------------------------------------
+
+	struct FResolvedProperty
+	{
+		FProperty* TopProperty = nullptr;
+		FProperty* LeafProperty = nullptr;
+		void* LeafValue = nullptr;
+	};
+
+	/**
+	 * Walks 'A.B[2].C' from Object down to the leaf value. Every segment must be editor-visible.
+	 * On anim graph nodes 'Node' always means the node's runtime struct.
+	 */
+	bool ResolvePropertyPath(UObject* Object, const FString& Path, FResolvedProperty& Out, FString& OutError);
+
+	/** Checks that Value parses for the property at Path without touching Object (imports into a scratch copy). */
+	bool CanImportPropertyValue(UObject* Object, const FString& Path, const FString& Value, FString& OutError);
+
+	/**
+	 * Sets a property on a node the way the details panel does (PreEditChange, import, PostEditChangeProperty, ReconstructNode).
+	 * The caller owns the transaction. OutReadBack receives the value as stored after the change.
+	 */
+	bool SetNodePropertyByPath(UEdGraphNode* Node, const FString& Path, const FString& Value, FString& OutReadBack, FString& OutError);
+
 	// ---- Serialization ---------------------------------------------------------------------
 
 	FString GuidToString(const FGuid& Guid);

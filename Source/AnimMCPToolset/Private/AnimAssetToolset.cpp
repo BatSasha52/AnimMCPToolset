@@ -16,6 +16,7 @@
 #include "Animation/BlendSpace.h"
 #include "Animation/BlendSpace1D.h"
 #include "Animation/Skeleton.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "EdGraphSchema_K2.h"
 #include "GameFramework/NavMovementComponent.h"
@@ -28,6 +29,7 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "Kismet/KismetSystemLibrary.h"
 #include "EdGraphToken.h"
+#include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/SkeletalMesh.h"
 #include "Factories/AnimBlueprintFactory.h"
 #include "Factories/BlendSpaceFactory1D.h"
@@ -37,7 +39,9 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/CompilerResultsLog.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Misc/PackageName.h"
 #include "Misc/StringOutputDevice.h"
+#include "ObjectTools.h"
 #include "Misc/UObjectToken.h"
 #include "ScopedTransaction.h"
 #include "UObject/Package.h"
@@ -197,6 +201,76 @@ namespace
 			return Json;
 		}
 		return nullptr;
+	}
+
+	/** The result of compiling a blueprint: status, counts and every message with the node it points at. */
+	struct FCompileReport
+	{
+		FString Status;
+		int32 NumErrors = 0;
+		int32 NumWarnings = 0;
+		TArray<TSharedRef<FJsonObject>> Messages;
+
+		TSharedRef<FJsonObject> ToJson() const
+		{
+			TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+			Json->SetStringField(TEXT("status"), Status);
+			Json->SetNumberField(TEXT("num_errors"), NumErrors);
+			Json->SetNumberField(TEXT("num_warnings"), NumWarnings);
+			Json->SetArrayField(TEXT("messages"), AnimMCP::ToJsonArray(Messages));
+			return Json;
+		}
+
+		/** Messages in this report whose severity and text do not appear in Other. */
+		TArray<TSharedRef<FJsonObject>> NotIn(const FCompileReport& Other) const
+		{
+			TArray<TSharedRef<FJsonObject>> Result;
+			for (const TSharedRef<FJsonObject>& Message : Messages)
+			{
+				const bool bFound = Other.Messages.ContainsByPredicate([&Message](const TSharedRef<FJsonObject>& Candidate)
+				{
+					return Candidate->GetStringField(TEXT("severity")) == Message->GetStringField(TEXT("severity"))
+						&& Candidate->GetStringField(TEXT("message")) == Message->GetStringField(TEXT("message"));
+				});
+				if (!bFound)
+				{
+					Result.Add(Message);
+				}
+			}
+			return Result;
+		}
+	};
+
+	FCompileReport CompileAndReport(UBlueprint* Blueprint)
+	{
+		FCompilerResultsLog Results;
+		Results.SetSourcePath(Blueprint->GetPathName());
+		Results.bSilentMode = true;
+		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection, &Results);
+
+		FCompileReport Report;
+		for (const TSharedRef<FTokenizedMessage>& Message : Results.Messages)
+		{
+			TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
+			Item->SetStringField(TEXT("severity"), FTokenizedMessage::GetSeverityText(Message->GetSeverity()).ToString());
+			Item->SetStringField(TEXT("message"), Message->ToText().ToString());
+			if (const TSharedPtr<FJsonObject> Source = DescribeMessageSource(*Message))
+			{
+				Item->SetObjectField(TEXT("source"), Source);
+			}
+			Report.Messages.Add(Item);
+		}
+		switch (Blueprint->Status)
+		{
+		case BS_UpToDate:             Report.Status = TEXT("up_to_date"); break;
+		case BS_UpToDateWithWarnings: Report.Status = TEXT("up_to_date_with_warnings"); break;
+		case BS_Error:                Report.Status = TEXT("error"); break;
+		case BS_Dirty:                Report.Status = TEXT("dirty"); break;
+		default:                      Report.Status = TEXT("unknown"); break;
+		}
+		Report.NumErrors = Results.NumErrors;
+		Report.NumWarnings = Results.NumWarnings;
+		return Report;
 	}
 
 	// ---- Locomotion starter variables ----------------------------------------------------
@@ -794,40 +868,7 @@ FAnimMCPResult UAnimAssetToolset::anim_compile_blueprint(const FString& blueprin
 		return AnimMCP::Fail(Error);
 	}
 
-	FCompilerResultsLog Results;
-	Results.SetSourcePath(AnimBP->GetPathName());
-	Results.bSilentMode = true;
-	FKismetEditorUtilities::CompileBlueprint(AnimBP, EBlueprintCompileOptions::SkipGarbageCollection, &Results);
-
-	TArray<TSharedPtr<FJsonValue>> Messages;
-	for (const TSharedRef<FTokenizedMessage>& Message : Results.Messages)
-	{
-		TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
-		Item->SetStringField(TEXT("severity"), FTokenizedMessage::GetSeverityText(Message->GetSeverity()).ToString());
-		Item->SetStringField(TEXT("message"), Message->ToText().ToString());
-		if (const TSharedPtr<FJsonObject> Source = DescribeMessageSource(*Message))
-		{
-			Item->SetObjectField(TEXT("source"), Source);
-		}
-		Messages.Add(MakeShared<FJsonValueObject>(Item));
-	}
-
-	FString Status;
-	switch (AnimBP->Status)
-	{
-	case BS_UpToDate:             Status = TEXT("up_to_date"); break;
-	case BS_UpToDateWithWarnings: Status = TEXT("up_to_date_with_warnings"); break;
-	case BS_Error:                Status = TEXT("error"); break;
-	case BS_Dirty:                Status = TEXT("dirty"); break;
-	default:                      Status = TEXT("unknown"); break;
-	}
-
-	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetStringField(TEXT("status"), Status);
-	Payload->SetNumberField(TEXT("num_errors"), Results.NumErrors);
-	Payload->SetNumberField(TEXT("num_warnings"), Results.NumWarnings);
-	Payload->SetArrayField(TEXT("messages"), Messages);
-	return AnimMCP::Ok(Payload);
+	return AnimMCP::Ok(CompileAndReport(AnimBP).ToJson());
 }
 
 FAnimMCPResult UAnimAssetToolset::anim_save_asset(const FString& asset_path)
@@ -910,6 +951,164 @@ FAnimMCPResult UAnimAssetToolset::anim_set_skeleton_compatible(const FString& sk
 	Payload->SetStringField(TEXT("skeleton"), Skeleton->GetPathName());
 	Payload->SetBoolField(TEXT("changed"), bChange);
 	Payload->SetArrayField(TEXT("compatible_skeletons"), AnimMCP::ToJsonArray(Compatible));
+	return AnimMCP::Ok(Payload);
+}
+
+FAnimMCPResult UAnimAssetToolset::anim_rename_anim_blueprint(const FString& blueprint_path, const FString& new_name, const FString& new_folder)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	UAnimBlueprint* AnimBP = AnimMCP::LoadAsset<UAnimBlueprint>(blueprint_path, /*bForWrite*/ true, Error);
+	if (!AnimBP)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	const FString OldPackageName = AnimBP->GetOutermost()->GetName();
+	const FString OldPath = AnimBP->GetPathName();
+	FString Folder;
+	if (AnimMCP::IsUnset(new_folder) || new_folder.TrimStartAndEnd().Equals(TEXT("auto"), ESearchCase::IgnoreCase))
+	{
+		Folder = FPackageName::GetLongPackagePath(OldPackageName);
+	}
+	else if (!AnimMCP::NormalizeFolder(new_folder, Folder, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+	const FString NewName = new_name.TrimStartAndEnd();
+	FString NewPackageName;
+	if (!AnimMCP::ValidateNewAssetLocation(Folder, NewName, NewPackageName, Error))
+	{
+		return AnimMCP::Fail(Error);
+	}
+
+	// Referencers are read before the rename, from the asset registry (saved packages).
+	TArray<FName> Referencers;
+	FAssetRegistryModule::GetRegistry().GetReferencers(FName(*OldPackageName), Referencers);
+	TArray<FString> ReferencerNames;
+	for (const FName& Referencer : Referencers)
+	{
+		if (Referencer.ToString() != OldPackageName)
+		{
+			ReferencerNames.Add(Referencer.ToString());
+		}
+	}
+
+	// ObjectTools::RenameSingleObject is the editor's own rename without the extras IAssetTools::RenameAssets adds:
+	// that function saves the renamed asset, its redirector and referencing packages, and deletes the old package when no
+	// redirector is needed. Here a redirector is always left and nothing is saved or deleted.
+	ObjectTools::FPackageGroupName PGN;
+	PGN.PackageName = NewPackageName;
+	PGN.ObjectName = NewName;
+	TSet<UPackage*> RefusedToLoad;
+	FText RenameError;
+	if (!ObjectTools::RenameSingleObject(AnimBP, PGN, RefusedToLoad, RenameError, nullptr, /*bLeaveRedirector*/ true))
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("Rename failed: %s"), *RenameError.ToString()));
+	}
+	AnimBP->MarkPackageDirty();
+	if (UPackage* OldPackage = FindPackage(nullptr, *OldPackageName))
+	{
+		OldPackage->MarkPackageDirty();
+	}
+
+	const FCompileReport Compile = CompileAndReport(AnimBP);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("old_path"), OldPath);
+	Payload->SetStringField(TEXT("new_path"), AnimBP->GetPathName());
+	Payload->SetStringField(TEXT("redirector"), OldPath);
+	Payload->SetArrayField(TEXT("referencers"), AnimMCP::ToJsonArray(ReferencerNames));
+	Payload->SetArrayField(TEXT("save_to_finish"), AnimMCP::ToJsonArray(TArray<FString>{ NewPackageName, OldPackageName }));
+	Payload->SetObjectField(TEXT("compile"), Compile.ToJson());
+	Payload->SetBoolField(TEXT("saved"), false);
+	return AnimMCP::Ok(Payload);
+}
+
+FAnimMCPResult UAnimAssetToolset::anim_reparent_anim_blueprint(const FString& blueprint_path, const FString& new_parent)
+{
+	ANIMMCP_REQUIRE_GAME_THREAD();
+
+	FString Error;
+	UAnimBlueprint* AnimBP = AnimMCP::LoadAsset<UAnimBlueprint>(blueprint_path, /*bForWrite*/ true, Error);
+	if (!AnimBP)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	UClass* NewParent = ResolveAnimInstanceClass(new_parent, Error);
+	if (!NewParent)
+	{
+		return AnimMCP::Fail(Error);
+	}
+	if (NewParent == AnimBP->ParentClass)
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("%s is already the parent class."), *NewParent->GetName()));
+	}
+	// Walk the blueprints' declared parents as well as the compiled classes: after an undo, or before a compile, a generated
+	// class can still have its old super class, and a cycle that slips through crashes the compiler.
+	int32 Guard = 0;
+	for (UClass* Ancestor = NewParent; Ancestor && Guard++ < 1024; )
+	{
+		const UBlueprint* AncestorBP = Cast<UBlueprint>(Ancestor->ClassGeneratedBy);
+		if (AncestorBP == AnimBP || Ancestor == AnimBP->GeneratedClass || Ancestor == AnimBP->SkeletonGeneratedClass)
+		{
+			return AnimMCP::Fail(FString::Printf(TEXT("%s is this blueprint or derives from it; a blueprint cannot be its own ancestor."), *NewParent->GetName()));
+		}
+		Ancestor = AncestorBP ? AncestorBP->ParentClass.Get() : Ancestor->GetSuperClass();
+	}
+	if ((AnimBP->GeneratedClass && NewParent->IsChildOf(AnimBP->GeneratedClass)) || (AnimBP->SkeletonGeneratedClass && NewParent->IsChildOf(AnimBP->SkeletonGeneratedClass)))
+	{
+		return AnimMCP::Fail(FString::Printf(TEXT("%s is this blueprint or derives from it; a blueprint cannot be its own ancestor."), *NewParent->GetName()));
+	}
+	if (const UAnimBlueprint* ParentBP = Cast<UAnimBlueprint>(NewParent->ClassGeneratedBy))
+	{
+		if (!ParentBP->bIsTemplate && ParentBP->TargetSkeleton && AnimBP->TargetSkeleton && !AnimBP->TargetSkeleton->IsCompatibleForEditor(ParentBP->TargetSkeleton))
+		{
+			return AnimMCP::Fail(FString::Printf(TEXT("%s targets skeleton %s, which is not compatible with this blueprint's skeleton %s. Use anim_set_skeleton_compatible first, or pick another parent."),
+				*ParentBP->GetName(), *ParentBP->TargetSkeleton->GetPathName(), *AnimBP->TargetSkeleton->GetPathName()));
+		}
+	}
+
+	const FCompileReport Before = CompileAndReport(AnimBP);
+	UClass* OldParent = AnimBP->ParentClass;
+	FCompileReport After;
+	{
+		// Mirrors FBlueprintEditor::ReparentBlueprint_NewParentChosen, without its dialogs and namespace import bookkeeping.
+		const FScopedTransaction Transaction(LOCTEXT("ReparentAnimBP", "AnimMCP: Reparent Animation Blueprint"));
+		AnimBP->Modify();
+		AnimBP->ParentClass = NewParent;
+		FBlueprintEditorUtils::RefreshAllNodes(AnimBP);
+		FBlueprintEditorUtils::MarkBlueprintAsModified(AnimBP);
+		if (UBlueprintGeneratedClass* GeneratedClass = Cast<UBlueprintGeneratedClass>(AnimBP->GeneratedClass))
+		{
+			GeneratedClass->PrepareToConformSparseClassData(NewParent->GetSparseClassDataStruct());
+		}
+		After = CompileAndReport(AnimBP);
+	}
+
+	auto BySeverity = [](const TArray<TSharedRef<FJsonObject>>& Messages, const TCHAR* Severity)
+	{
+		TArray<TSharedRef<FJsonObject>> Result;
+		for (const TSharedRef<FJsonObject>& Message : Messages)
+		{
+			if (Message->GetStringField(TEXT("severity")).Equals(Severity, ESearchCase::IgnoreCase))
+			{
+				Result.Add(Message);
+			}
+		}
+		return Result;
+	};
+	const TArray<TSharedRef<FJsonObject>> Added = After.NotIn(Before);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("path"), AnimBP->GetPathName());
+	Payload->SetStringField(TEXT("old_parent"), OldParent ? OldParent->GetPathName() : FString());
+	Payload->SetStringField(TEXT("new_parent"), NewParent->GetPathName());
+	Payload->SetObjectField(TEXT("compile"), After.ToJson());
+	Payload->SetArrayField(TEXT("new_errors"), AnimMCP::ToJsonArray(BySeverity(Added, TEXT("Error"))));
+	Payload->SetArrayField(TEXT("new_warnings"), AnimMCP::ToJsonArray(BySeverity(Added, TEXT("Warning"))));
+	Payload->SetArrayField(TEXT("fixed"), AnimMCP::ToJsonArray(Before.NotIn(After)));
+	Payload->SetBoolField(TEXT("broke"), Before.NumErrors == 0 && After.NumErrors > 0);
 	return AnimMCP::Ok(Payload);
 }
 
