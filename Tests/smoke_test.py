@@ -3,6 +3,11 @@
 #
 #   UnrealEditor-Cmd.exe <Project>.uproject -run=pythonscript -script=<path>/smoke_test.py -unattended -nullrhi
 #
+# The commandlet has no undo buffer, so the undo checks are skipped there. To include them, run the full editor
+# headless instead (the script quits the editor when it is done):
+#
+#   UnrealEditor-Cmd.exe <Project>.uproject -ExecutePythonScript=<path>/smoke_test.py -unattended -nullrhi -nosplash -nosound
+#
 # It creates assets under /Game/AMCPTest, so the project must not already contain that folder.
 # Results go to $ANIMMCP_SMOKE_OUT (default <Project>/Saved/animmcp_smoke.txt); the last line is the summary.
 import json, os, unreal
@@ -12,6 +17,10 @@ OUT = open(os.environ.get("ANIMMCP_SMOKE_OUT") or os.path.join(unreal.Paths.proj
 def log(msg):
     LOG.append(msg)
     OUT.write(msg + "\n"); OUT.flush()
+
+# Undo needs the editor's transaction buffer; the -run=pythonscript commandlet has none (begin_transaction returns -1).
+TRANSACTIONS = unreal.SystemLibrary.begin_transaction("AnimMCP smoke test", "probe", None) != -1
+unreal.SystemLibrary.end_transaction()
 
 def call(toolset, tool, **args):
     r = unreal.ToolsetRegistry.execute_tool("AnimMCPToolset." + toolset, tool, json.dumps(args))
@@ -507,5 +516,180 @@ r and check(r.get("bones_measured") == ["hand_r"], "explicit travel bone", r.get
 expect_fail("AnimDataToolset", "anim_get_animation_info", asset_path=BS)
 expect_fail("AnimDataToolset", "anim_sample_bones", asset_path=BS, time=0)
 
+# --- v0.3 step 4: animation data editing (copies by default, curves, notifies, in-place travel, montages)
+CONTENT = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_content_dir())
+def on_disk(path):
+    return os.path.exists(os.path.join(CONTENT, path[len("/Game/"):] + ".uasset"))
+
+err = expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]")
+check("explicit output_path" in err, "copy of an /Engine asset needs an explicit output_path", err[:100])
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]", in_place=True)
+WC = "/Game/AMCPTest/Walk_Curve"
+r = ok("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0], [0.5, 1], [1.0, 0.25]]", output_path=WC)
+if r:
+    check(r["path"].startswith(WC + ".") and not r["in_place"] and r["created"] and r["key_count"] == 3, "curve written to a new copy", (r["path"], r["created"], r["key_count"]))
+    check(not on_disk(WC), "the copy is not saved to disk", WC)
+    src = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WALK, travel_bones="none")
+    cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+    src and check(src["curves"] == [], "source animation untouched", src["curves"])
+    cp and check([(c["name"], c["key_count"], round(c["min_value"], 3), round(c["max_value"], 3)) for c in cp["curves"]] == [("Lean", 3, 0, 1)], "copy has the curve", cp["curves"])
+err = expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Lean", keys="[[0, 0]]", output_path=WC)
+check("already exists" in err, "name collision rejected", err[:80])
+r = ok("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys='[{"time": 0, "value": 2}, {"time": 1.5, "value": 3}]', interpolation="linear", in_place=True)
+r and check(r["in_place"] and not r["created"] and r["key_count"] == 2, "in_place replaces keys of an existing curve", (r["in_place"], r["created"]))
+cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+cp and check([(c["name"], c["key_count"], round(c["min_value"], 3), round(c["max_value"], 3)) for c in cp["curves"]] == [("Lean", 2, 2, 3)], "replaced keys read back", cp["curves"])
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1], [0, 2]]", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[99, 1]]", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1]]", interpolation="bezier", in_place=True)
+expect_fail("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="Lean", keys="[[0, 1]]", in_place=True, output_path="/Game/AMCPTest/X")
+r = ok("AnimDataToolset", "anim_remove_curve", animation_path=WC, curve_name="Lean", in_place=True)
+cp = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+cp and check(cp["curves"] == [], "curve removed", cp["curves"])
+expect_fail("AnimDataToolset", "anim_remove_curve", animation_path=WC, curve_name="Lean", in_place=True)
+
+# Notifies
+fr = cp["frame_rate"] if cp else 30
+n1 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="Footstep_L", frame=10, track="Feet", in_place=True)
+n2 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="none", time=0.5, notify_class="AnimNotify_PlaySound", in_place=True)
+n3 = ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="Trail", time=0.2, notify_class="AnimNotifyState_Trail", duration=0.3, track="FX", in_place=True)
+if n1 and n2 and n3:
+    a, b, c = n1["notify"], n2["notify"], n3["notify"]
+    check(a["name"] == "Footstep_L" and abs(a["time"] - 10 / fr) < 1e-4 and abs(a["frame"] - 10) < 1e-3 and a["track"] == "Feet" and a["class"] == "" and a["guid"].count("-") == 4,
+          "named notify at frame 10 on track Feet", a)
+    check(b["class"].endswith("AnimNotify_PlaySound") and not b["is_state"] and b["track"] == "1", "class notify on default track", b)
+    check(c["is_state"] and abs(c["duration"] - 0.3) < 1e-4 and c["name"] == "Trail" and c["track"] == "FX", "notify state with duration", c)
+    info = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+    info and check(sorted(n["guid"] for n in info["notifies"]) == sorted([a["guid"], b["guid"], c["guid"]]) and {"Feet", "FX", "1"} <= set(info["notify_tracks"]),
+                   "info lists the notifies and tracks", (len(info["notifies"]), info["notify_tracks"]))
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], name="Footstep_R", frame=20, track="Hands", in_place=True)
+    u and check(u["notify"]["guid"] == a["guid"] and u["notify"]["name"] == "Footstep_R" and abs(u["notify"]["frame"] - 20) < 1e-3 and u["notify"]["track"] == "Hands",
+                "update renames, moves and re-tracks by guid", u["notify"])
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=c["guid"], duration=0.5, in_place=True)
+    u and check(abs(u["notify"]["duration"] - 0.5) < 1e-4 and abs(u["notify"]["time"] - 0.2) < 1e-4, "update a state's duration keeps its time", u["notify"])
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], duration=0.5, in_place=True)
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify=a["guid"], in_place=True)
+    expect_fail("AnimDataToolset", "anim_update_notify", animation_path=WC, notify="index:99", name="X", in_place=True)
+    u = ok("AnimDataToolset", "anim_update_notify", animation_path=WC, notify="index:0", name="First", in_place=True)
+    u and check(u["notify"]["name"] == "First", "update by index", u["notify"]["name"])
+    # A copy of a /Game animation gets the automatic name and keeps the notify guids.
+    cpy = ok("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify=b["guid"])
+    if cpy:
+        check(cpy["path"].startswith(WC + "_Edited.") and cpy["removed"]["guid"] == b["guid"], "remove on an automatic copy", cpy["path"])
+        i1 = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")
+        i2 = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC + "_Edited", travel_bones="none")
+        i1 and i2 and check(len(i1["notifies"]) == 3 and len(i2["notifies"]) == 2 and b["guid"] not in [n["guid"] for n in i2["notifies"]],
+                            "copy lost the notify, the original kept it", (len(i1["notifies"]), len(i2["notifies"])))
+    expect_fail("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify=b["guid"])  # WC_Edited exists now
+    expect_fail("AnimDataToolset", "anim_remove_notify", animation_path=WC, notify="00000000-0000-0000-0000-000000000001", in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, frame=3, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=99, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="none", time=0.1, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, notify_class="AnimNotifyState_Trail", in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, duration=1, in_place=True)
+expect_fail("AnimDataToolset", "anim_add_notify", animation_path=WC, name="X", time=0.1, notify_class="NoSuchNotify", in_place=True)
+
+# In-place travel: inject a known forward drift into the pelvis of a copy, then remove it.
+WT = "/Game/AMCPTest/Walk_Travel"
+ok("AnimDataToolset", "anim_set_curve", animation_path=WALK, curve_name="Tmp", keys="[[0, 0]]", output_path=WT)
+wi = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+seq = unreal.load_asset(WT)
+if wi and seq:
+    nkeys = wi["key_count"]
+    pos, rot, scl = [], [], []
+    for k in range(nkeys):
+        s = ok("AnimDataToolset", "anim_sample_bones", asset_path=WT, time=k / wi["frame_rate"], bones="pelvis", space="parent")["bones"][0]
+        t = k / (nkeys - 1)
+        pos.append(unreal.Vector(s["translation"][0] + 60 * t, s["translation"][1] + 120 * t, s["translation"][2]))
+        rot.append(unreal.Quat(*s["quaternion"]))
+        scl.append(unreal.Vector(*s["scale"]))
+    seq.get_editor_property("controller").set_bone_track_keys("pelvis", pos, rot, scl, True)
+    wi = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+    pt = {t["bone"].lower(): t for t in wi["travel"]}["pelvis"]
+    check(abs(pt["delta"]["x"] - 60) < 0.01 and abs(pt["delta"]["y"] - 120) < 0.01 and abs(pt["delta"]["z"]) < 0.01, "test drift injected into the pelvis", pt["delta"])
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT)
+    if r:
+        check(r["bone"] == "pelvis" and "hips" in r["reason"] and r["path"].startswith(WT + "_Edited.") and r["keys_changed"] == nkeys,
+              "auto picks the hips (root does not move) and writes a copy", (r["bone"], r["reason"], r["path"]))
+        check(abs(r["before"]["delta"]["y"] - 120) < 0.01 and abs(r["after"]["delta"]["x"]) < 0.01 and abs(r["after"]["delta"]["y"]) < 0.01,
+              "xy drift removed", (r["before"]["delta"], r["after"]["delta"]))
+        mid = (nkeys // 2) / wi["frame_rate"]
+        o = ok("AnimDataToolset", "anim_sample_bones", asset_path=WALK, time=mid, bones="pelvis")
+        e = ok("AnimDataToolset", "anim_sample_bones", asset_path=WT + "_Edited", time=mid, bones="pelvis")
+        o and e and check(close(o["bones"][0]["translation"], e["bones"][0]["translation"], 0.01) and close(o["bones"][0]["quaternion"], e["bones"][0]["quaternion"], 1e-4),
+                          "sway and rotation kept: mid-frame pelvis matches the original walk", (o["bones"][0]["translation"], e["bones"][0]["translation"]))
+        src = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT)
+        src and check(abs({t["bone"].lower(): t for t in src["travel"]}["pelvis"]["delta"]["y"] - 120) < 0.01, "source keeps its travel")
+        err = expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT + "_Edited", in_place=True)
+        check("nothing to remove" in err, "already in place is reported, not silently re-saved", err[:90])
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="pelvis", axes="z", mode="flatten", output_path="/Game/AMCPTest/Walk_FlatZ")
+    if r:
+        zs = [ok("AnimDataToolset", "anim_sample_bones", asset_path="/Game/AMCPTest/Walk_FlatZ", time=t, bones="pelvis")["bones"][0]["translation"][2] for t in (0, wi["length"] / 3, wi["length"] / 2)]
+        check(max(zs) - min(zs) < 0.01 and abs(r["after"]["delta"]["y"] - 120) < 0.01, "flatten z holds the first frame and leaves x/y alone", (zs, r["after"]["delta"]))
+    r = ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="pelvis", axes="xy", in_place=True)
+    r and check(r["in_place"] and abs(r["after"]["delta"]["y"]) < 0.01, "in_place edit of a /Game animation", r["after"]["delta"])
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WALK, in_place=True)
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, axes="q", output_path="/Game/AMCPTest/Nope1")
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, mode="wobble", output_path="/Game/AMCPTest/Nope2")
+expect_fail("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT, bone="no_such_bone", output_path="/Game/AMCPTest/Nope3")
+check(not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/Nope1") and not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/Nope3"), "rejected edits create no copy")
+
+# Montages. The slot name is one no Slot node uses: compiling an Animation Blueprint registers its Slot nodes' names on the skeleton.
+r = ok("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Walk", animation_path=WALK, slot_name="AMCP_MontageOnly",
+       sections=json.dumps([{"name": "Start", "time": 0}, {"name": "Loop", "time": 0.5, "next": "Loop"}, {"name": "End", "time": 1.2}]))
+if r:
+    check([(s["name"], round(s["time"], 3), s["next"]) for s in r["sections"]] == [("Start", 0, "Loop"), ("Loop", 0.5, "Loop"), ("End", 1.2, "")],
+          "montage sections and links", r["sections"])
+    check(r["slot_name"] == "AMCP_MontageOnly" and not r["slot_on_skeleton"] and len(r["warnings"]) == 1 and abs(r["length"] - wi["length"]) < 1e-3 and not on_disk("/Game/AMCPTest/AM_Walk"),
+          "montage slot, length, unregistered-slot warning, not saved", (r["slot_name"], r["length"], r["warnings"]))
+    m = unreal.load_asset("/Game/AMCPTest/AM_Walk")
+    check(m and str(m.get_editor_property("slot_anim_tracks")[0].get_editor_property("slot_name")) == "AMCP_MontageOnly", "slot name stored on the asset")
+    mi = ok("AnimDataToolset", "anim_get_animation_info", asset_path="/Game/AMCPTest/AM_Walk")
+    mi and check(mi["class"] == "AnimMontage" and "travel" not in mi, "info on a montage", mi["class"])
+    n = ok("AnimDataToolset", "anim_add_notify", animation_path="/Game/AMCPTest/AM_Walk", name="Hit", time=0.6, in_place=True)
+    n and check(n["notify"]["name"] == "Hit", "notify on a montage", n["notify"])
+r = ok("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Default", animation_path=WALK, sections='[{"name": "Mid", "time": 0.5, "next": ""}]')
+r and check([(s["name"], s["next"]) for s in r["sections"]] == [("Default", "Mid"), ("Mid", "")] and r["slot_on_skeleton"] and r["warnings"] == [],
+            "Default section added at 0, DefaultSlot is on the skeleton", r["sections"])
+err = expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Bad", animation_path=WALK,
+                  sections=json.dumps([{"name": "A", "time": 0}, {"name": "A", "time": 0.2}, {"name": "B", "time": 99, "next": "Nope"}, {"name": "C", "time": 0.3, "colour": 1}]))
+check(all(w in err for w in ["used twice", "outside the animation", "'Nope' is not in the list", "unknown field 'colour'"]) and not unreal.EditorAssetLibrary.does_asset_exist("/Game/AMCPTest/AM_Bad"),
+      "bad sections listed, nothing created", err[:200])
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_Walk", animation_path=WALK)
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Engine/X", asset_name="AM_X", animation_path=WALK)
+expect_fail("AnimDataToolset", "anim_create_montage", folder="/Game/AMCPTest", asset_name="AM_BS", animation_path=BS)
+
+# Undo: each in-place edit is one transaction, and the data model is restored with it.
+def skip(what):
+    log("SKIP %s: no undo buffer in this mode (run with -ExecutePythonScript to include it)" % what)
+
+def curve_names(path):
+    i = ok("AnimDataToolset", "anim_get_animation_info", asset_path=path, travel_bones="none")
+    return [c["name"] for c in i["curves"]] if i else None
+def undo():
+    unreal.SystemLibrary.execute_console_command(None, "TRANSACTION UNDO")
+if TRANSACTIONS:
+    ok("AnimDataToolset", "anim_set_curve", animation_path=WC, curve_name="UndoMe", keys="[[0, 1], [1, 2]]", in_place=True)
+    had = curve_names(WC)
+    undo()
+    check(had and "UndoMe" in had and "UndoMe" not in (curve_names(WC) or ["?"]), "undo removes an in-place curve edit", (had, curve_names(WC)))
+    nb = len(ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")["notifies"])
+    ok("AnimDataToolset", "anim_add_notify", animation_path=WC, name="UndoNotify", time=0.1, in_place=True)
+    undo()
+    na = len(ok("AnimDataToolset", "anim_get_animation_info", asset_path=WC, travel_bones="none")["notifies"])
+    check(na == nb, "undo removes an added notify", (nb, na))
+    tb = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT + "_Edited")
+    ok("AnimDataToolset", "anim_remove_bone_travel", animation_path=WT + "_Edited", bone="pelvis", axes="z", mode="flatten", in_place=True)
+    undo()
+    ta = ok("AnimDataToolset", "anim_get_animation_info", asset_path=WT + "_Edited")
+    pz = lambda i: {t["bone"].lower(): t for t in i["travel"]}["pelvis"]["path_length"]
+    tb and ta and check(abs(pz(tb) - pz(ta)) < 1e-3, "undo restores bone keys", (pz(tb), pz(ta)))
+else:
+    skip("undo of curve, notify and bone key edits")
+
 fails = [l for l in LOG if l.startswith("FAIL")]
-log("SUMMARY: %d checks, %d failures" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails)))
+log("SUMMARY: %d checks, %d failures, %d skipped (%s)" % (len([l for l in LOG if l.startswith(("OK", "FAIL"))]), len(fails),
+    len([l for l in LOG if l.startswith("SKIP")]), "full editor" if TRANSACTIONS else "commandlet"))
+OUT.close()
+if TRANSACTIONS:
+    unreal.SystemLibrary.quit_editor()
